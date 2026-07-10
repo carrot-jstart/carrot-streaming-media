@@ -32,56 +32,423 @@ ffmpeg (推流)
    WebCodecs → Canvas
 ```
 
-## 快速部署
+## 下载与部署
 
-### 编译
+从 [GitHub Releases](https://github.com/你的用户名/carrot-streaming-media/releases) 下载对应平台的包。
+
+每个 Release 包含以下资产：
+
+| 文件 | 适用平台 |
+|------|---------|
+| `carrot-streaming-media-windows-amd64.zip` | Windows 10/11 (amd64) |
+| `carrot-streaming-media-linux-amd64.tar.gz` | Linux (amd64) |
+| `carrot-streaming-media-darwin-amd64.tar.gz` | macOS Intel |
+| `carrot-streaming-media-darwin-arm64.tar.gz` | macOS Apple Silicon (M1/M2/M3) |
+| `carrot-streaming-media-docker.tar.gz` | Docker 镜像 (任意平台) |
+
+---
+
+### Windows 部署
+
+**1. 解压**
+
+```powershell
+# 解压到目标目录（如 C:\carrot）
+Expand-Archive -Path carrot-streaming-media-windows-amd64.zip -DestinationPath C:\carrot
+cd C:\carrot
+```
+
+解压后目录结构：
+```
+C:\carrot\
+├── carrot-server.exe    # 服务器程序
+├── carrot.conf          # 配置文件
+├── web\                 # 静态文件目录
+│   ├── index.html
+│   └── js\player.js
+└── README.md
+```
+
+**2. 配置 SSL 证书**
+
+使用 mkcert 生成浏览器信任的本地证书：
+
+```powershell
+# 安装 mkcert（需要管理员 PowerShell）
+winget install FiloSottile.mkcert  # 或 choco install mkcert
+
+# 安装 CA 到系统信任
+mkcert -install
+
+# 在 C:\carrot 下创建 cert 目录并生成证书
+mkdir cert
+cd cert
+mkcert localhost 127.0.0.1 ::1
+cd ..
+```
+
+修改 `carrot.conf` 中的证书路径：
+
+```ini
+ssl_certificate=./cert/localhost+3.pem
+ssl_certificate_key=./cert/localhost+3-key.pem
+```
+
+**3. 启动服务器**
+
+```powershell
+# 前台运行
+.\carrot-server.exe
+
+# 或指定配置文件
+.\carrot-server.exe -config=carrot.conf
+```
+
+**4. 注册为 Windows 服务（可选）**
+
+使用 [NSSM](https://nssm.cc/) 将服务器注册为 Windows 服务：
+
+```powershell
+nssm install CarrotStreaming "C:\carrot\carrot-server.exe"
+nssm start CarrotStreaming
+```
+
+---
+
+### Linux 部署
+
+**1. 解压**
+
+```bash
+tar xzf carrot-streaming-media-linux-amd64.tar.gz -C /opt/carrot
+cd /opt/carrot
+```
+
+**2. 配置 SSL 证书**
+
+使用 mkcert 或 Let's Encrypt 生成证书。
+
+**方式一：mkcert（本地测试）**
+
+```bash
+# 安装 mkcert
+sudo apt install libnss3-tools  # Debian/Ubuntu
+wget -O mkcert https://github.com/FiloSottile/mkcert/releases/latest/download/mkcert-v*-linux-amd64
+chmod +x mkcert && sudo mv mkcert /usr/local/bin/
+
+mkcert -install
+mkdir -p /opt/carrot/cert && cd /opt/carrot/cert
+mkcert localhost 127.0.0.1 ::1
+```
+
+**方式二：Let's Encrypt（生产环境）**
+
+```bash
+# 安装 certbot
+sudo apt install certbot  # Debian/Ubuntu
+# sudo yum install certbot  # CentOS/RHEL
+
+# 申请证书（需要公网 IP 和域名）
+sudo certbot certonly --standalone -d your-domain.com
+
+# 证书路径：/etc/letsencrypt/live/your-domain.com/fullchain.pem
+# 私钥路径：/etc/letsencrypt/live/your-domain.com/privkey.pem
+```
+
+修改 `carrot.conf`：
+
+```ini
+ssl_certificate=/etc/letsencrypt/live/your-domain.com/fullchain.pem
+ssl_certificate_key=/etc/letsencrypt/live/your-domain.com/privkey.pem
+http_port=7777
+rtmp_port=1935
+web_dir=./web
+log_level=info
+```
+
+**3. 启动服务器**
+
+```bash
+cd /opt/carrot
+chmod +x carrot-server
+
+# 前台运行
+./carrot-server
+
+# 后台运行（nohup）
+nohup ./carrot-server > carrot.log 2>&1 &
+```
+
+**4. 注册为 systemd 服务（推荐生产环境）**
+
+```bash
+sudo tee /etc/systemd/system/carrot-streaming.service > /dev/null <<'EOF'
+[Unit]
+Description=Carrot Streaming Media Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/carrot
+ExecStart=/opt/carrot/carrot-server
+Restart=always
+RestartSec=5
+User=nobody
+Group=nogroup
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now carrot-streaming
+
+# 查看状态
+sudo systemctl status carrot-streaming
+# 查看日志
+sudo journalctl -u carrot-streaming -f
+```
+
+---
+
+### macOS 部署
+
+**Intel 芯片** 下载 `carrot-streaming-media-darwin-amd64.tar.gz`  
+**Apple Silicon (M系列)** 下载 `carrot-streaming-media-darwin-arm64.tar.gz`
+
+**1. 解压**
+
+```bash
+# Apple Silicon
+tar xzf carrot-streaming-media-darwin-arm64.tar.gz -C /opt/carrot
+# Intel
+tar xzf carrot-streaming-media-darwin-amd64.tar.gz -C /opt/carrot
+
+cd /opt/carrot
+```
+
+**2. 配置 SSL 证书**
+
+```bash
+# 安装 mkcert
+brew install mkcert
+
+# 安装 CA 到系统信任
+mkcert -install
+
+# 生成证书
+mkdir -p /opt/carrot/cert && cd /opt/carrot/cert
+mkcert localhost 127.0.0.1 ::1
+cd /opt/carrot
+```
+
+修改 `carrot.conf`：
+
+```ini
+ssl_certificate=./cert/localhost+3.pem
+ssl_certificate_key=./cert/localhost+3-key.pem
+```
+
+**3. 启动服务器**
+
+```bash
+cd /opt/carrot
+chmod +x carrot-server
+
+# 前台运行
+./carrot-server
+
+# 后台运行
+nohup ./carrot-server > carrot.log 2>&1 &
+```
+
+**4. 注册为 LaunchDaemon（可选，开机自启）**
+
+```bash
+sudo tee /Library/LaunchDaemons/com.carrot.streaming.plist > /dev/null <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.carrot.streaming</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/carrot/carrot-server</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/opt/carrot</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/opt/carrot/carrot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/opt/carrot/carrot.log</string>
+</dict>
+</plist>
+EOF
+
+sudo launchctl load /Library/LaunchDaemons/com.carrot.streaming.plist
+```
+
+---
+
+### Docker 部署
+
+**1. 加载镜像**
+
+```bash
+# 从 Release 下载 carrot-streaming-media-docker.tar.gz
+gunzip -c carrot-streaming-media-docker.tar.gz | docker load
+```
+
+或直接从源码构建：
+
+```bash
+docker build -t carrot-streaming-media .
+```
+
+**2. 创建数据目录**
+
+```bash
+mkdir -p /opt/carrot/cert /opt/carrot/config
+```
+
+**3. 配置证书**
+
+```bash
+# 使用 mkcert 生成证书
+mkcert -install
+cd /opt/carrot/cert
+mkcert localhost 127.0.0.1 ::1
+```
+
+**4. 创建配置文件目录** `/opt/carrot/config/carrot.conf`：
+
+```bash
+mkdir -p /opt/carrot/config
+```
+
+创建 `/opt/carrot/config/carrot.conf`：
+
+```ini
+ssl_certificate=/app/cert/localhost+3.pem
+ssl_certificate_key=/app/cert/localhost+3-key.pem
+http_port=7777
+rtmp_port=1935
+web_dir=/app/web
+log_level=info
+```
+
+**5. 运行容器**
+
+```bash
+docker run -d \
+  --name carrot-streaming \
+  --restart always \
+  -p 7777:7777 \
+  -p 1935:1935 \
+  -v /opt/carrot/config:/app/config \
+  -v /etc/letsencrypt/live:/app/cert \
+  carrot-streaming-media:latest
+```
+
+**参数说明：**
+- `-p 7777:7777` — 映射 HTTPS/WSS 播放端口
+- `-p 1935:1935` — 映射 RTMP 推流端口
+- `-v /opt/carrot/config:/app/config` — 挂载配置**目录**（容器内自动读取 `config/carrot.conf`）
+- `-v /etc/letsencrypt/live:/app/cert` — 挂载证书目录
+- `--restart always` — 容器退出后自动重启
+
+**查看日志：**
+
+```bash
+docker logs -f carrot-streaming
+```
+
+**使用 docker-compose（推荐）：**
+
+创建 `docker-compose.yml`：
+
+```yaml
+version: "3.9"
+services:
+  carrot-streaming:
+    image: carrot-streaming-media:latest
+    container_name: carrot-streaming
+    restart: always
+    ports:
+      - "7777:7777"
+      - "1935:1935"
+    volumes:
+      - ./config:/app/config
+      - /etc/letsencrypt/live:/app/cert
+```
+
+```bash
+docker-compose up -d
+```
+
+> **提示：**
+> - 镜像内置了默认的 `carrot.conf`（位于 `/app/config/`），挂载配置目录会替换为你的配置
+> - `carrot.conf` 中的证书路径使用容器内路径 `/app/cert/`，而不是宿主机路径
+> - 挂载配置**目录**而非单个文件，避免 overlay2 文件系统冲突
+
+---
+
+### 源码编译
+
+如果希望从源码编译而非使用预编译包：
 
 ```bash
 # 1. 克隆项目
+git clone https://github.com/你的用户名/carrot-streaming-media.git
 cd carrot-streaming-media
 
 # 2. 编译
-go build -o carrot-server.exe ./cmd/server
+go build -ldflags="-s -w" -o carrot-server ./cmd/server
 
 # 3. 运行
-./carrot-server.exe
+./carrot-server
 ```
 
-或直接用 `go run`：
+> 需要安装 [Go](https://go.dev/dl/) 1.25 或更高版本。
+
+## 配置文件
+
+服务器自动读取 `carrot.conf`，也可以通过 `-config` 指定：
 
 ```bash
-go run ./cmd/server
-```
-
-### 配置文件
-
-服务器自动读取 `arrot.conf`，也可以指定：
-
-```bash
-./carrot-server.exe -config=arrot.conf
+./carrot-server -config=carrot.conf
 ```
 
 完整配置项：
 
 ```ini
-ssl_certificate=./cert/localhost+3.pem        # SSL 证书
-ssl_certificate_key=./cert/localhost+3-key.pem # SSL 私钥
+ssl_certificate=./cert/localhost+3.pem        # SSL 证书路径（PEM 格式）
+ssl_certificate_key=./cert/localhost+3-key.pem # SSL 私钥路径
 http_port=7777                                 # 播放页面端口 (HTTPS/WSS)
 rtmp_port=1935                                 # 推流端口 (RTMP)
 web_dir=./web                                  # 静态文件目录
-log_level=info                                 # 日志级别
+log_level=info                                 # 日志级别: debug, info, warn, error
 ```
 
-### 证书配置
+> 所有路径均为**相对于工作目录**的相对路径，或绝对路径。Docker 容器内注意路径映射。
+
+## 证书配置
 
 项目使用标准的 PEM 证书文件，通过 `ssl_certificate` / `ssl_certificate_key` 指定路径。
 
-#### 使用 mkcert（推荐，浏览器信任）
+### 使用 mkcert（推荐，浏览器信任）
 
 ```bash
 # 1. 安装 mkcert
-# Windows: choco install mkcert 或从 https://github.com/FiloSottile/mkcert/releases 下载
+# Windows: winget install FiloSottile.mkcert 或 choco install mkcert
 # macOS: brew install mkcert
+# Linux: 从 https://github.com/FiloSottile/mkcert/releases 下载
 
 # 2. 安装 CA 到系统信任
 mkcert -install
@@ -91,14 +458,30 @@ cd cert
 mkcert localhost 127.0.0.1 ::1
 # 生成 localhost+3.pem 和 localhost+3-key.pem
 
-# 4. 更新 arrot.conf 中的路径指向新生成的文件
+# 4. 更新 carrot.conf 中的路径指向新生成的文件
 ```
 
 mkcert 安装 CA 后，浏览器访问 `https://localhost:7777` 直接显示安全锁，无警告。
 
-#### 使用自签名证书
+### 使用 Let's Encrypt（生产环境）
 
-生成自签名证书并配置到 `arrot.conf` 即可。需要手动在浏览器接受安全警告。
+```bash
+# 安装 certbot
+sudo apt install certbot
+
+# 申请证书（需要公网 IP 和域名）
+sudo certbot certonly --standalone -d your-domain.com
+
+# 配置 carrot.conf
+ssl_certificate=/etc/letsencrypt/live/your-domain.com/fullchain.pem
+ssl_certificate_key=/etc/letsencrypt/live/your-domain.com/privkey.pem
+```
+
+> Let's Encrypt 证书有效期为 90 天，建议配置自动续期：`sudo certbot renew --quiet`
+
+### 使用自签名证书
+
+生成自签名证书并配置到 `carrot.conf` 即可。需要手动在浏览器接受安全警告。
 
 ## 使用
 

@@ -16,8 +16,8 @@ RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=builder /carrot-server .
 COPY web ./web
-COPY carrot.conf .
+COPY carrot.conf ./config/
 
 EXPOSE 7777 1935
 
-ENTRYPOINT ["./carrot-server"]
+ENTRYPOINT ["./carrot-server", "-config=config/carrot.conf"]
