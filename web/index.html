@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Carrot Streaming Media</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            overflow: hidden;
+        }
+        canvas {
+            width: 100vw;
+            height: 100vh;
+            object-fit: contain;
+            display: block;
+        }
+        #status {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: #666;
+            font-family: monospace;
+            font-size: 13px;
+            background: rgba(0,0,0,0.7);
+            padding: 6px 14px;
+            border-radius: 6px;
+            pointer-events: none;
+            transition: color 0.3s;
+        }
+        #status.error { color: #ff4757; }
+        #status.connected { color: #2ed573; }
+        #placeholder {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #444;
+            font-family: sans-serif;
+            font-size: 14px;
+            text-align: center;
+            pointer-events: none;
+        }
+        #placeholder .hint {
+            font-size: 12px;
+            color: #333;
+            margin-top: 8px;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="videoCanvas"></canvas>
+    <div id="placeholder">
+        <div>正在连接...</div>
+        <div class="hint" id="streamPath"></div>
+    </div>
+    <div id="status">等待连接</div>
+    <script src="js/player.js"></script>
+</body>
+</html>
