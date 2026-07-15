@@ -203,6 +203,7 @@ func (s *PushServer) handleVideoPush(conn *gorilla.Conn, connID string, stream *
 		}
 
 		if !configDone {
+			log.Printf("[Push] %s: received config message (%d bytes)", connID, len(msg))
 			if err := s.handleVideoConfig(stream, msg, connID); err != nil {
 				log.Printf("[Push] %s: invalid video config: %v", connID, err)
 				return
@@ -211,6 +212,7 @@ func (s *PushServer) handleVideoPush(conn *gorilla.Conn, connID string, stream *
 			if t0.IsZero() {
 				t0 = time.Now()
 			}
+			log.Printf("[Push] %s: config processed successfully, stream has config=%v", connID, stream.HasConfig())
 			continue
 		}
 
@@ -221,6 +223,7 @@ func (s *PushServer) handleVideoPush(conn *gorilla.Conn, connID string, stream *
 
 		// Parse frame header
 		if len(msg) < 5 {
+			log.Printf("[Push] %s: frame too short (%d bytes), skipping", connID, len(msg))
 			continue
 		}
 		timestampMs := binary.BigEndian.Uint32(msg[0:4])
@@ -232,8 +235,8 @@ func (s *PushServer) handleVideoPush(conn *gorilla.Conn, connID string, stream *
 		}
 		stream.BroadcastVideoData(frameData, timestampMs, isKeyFrame)
 
-		if frameIndex%100 == 0 {
-			log.Printf("[Push] %s: pushed %d video frames", connID, frameIndex)
+		if frameIndex <= 3 || frameIndex%100 == 0 {
+			log.Printf("[Push] %s: frame #%d key=%v ts=%d dataLen=%d", connID, frameIndex, isKeyFrame, timestampMs, len(frameData))
 		}
 	}
 }

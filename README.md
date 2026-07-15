@@ -46,6 +46,8 @@
 
 ### 二进制消息协议
 
+#### 播放协议（服务器 → 浏览器）
+
 服务器与浏览器之间使用二进制帧通信：
 
 ```
@@ -56,6 +58,35 @@
   1 = 视频帧
   2 = 音频编解码配置
   3 = 音频帧
+```
+
+**视频配置格式（type=0）：**
+```
+[1 byte: codec=0(H264)]  [4 bytes: sps_length]  [sps]  [4 bytes: pps_length]  [pps]
+```
+
+**视频帧格式（type=1）：**
+```
+[1 byte: frame_type(0=关键帧, 1=P帧)]  [H.264 AVCC 数据(4字节NALU长度前缀)]
+```
+
+**音频配置格式（type=2）：**
+```
+[1 byte: codec_type(0=AAC, 1=MP3)]  [4 bytes: sample_rate]  [1 byte: channels]  [AudioSpecificConfig]
+```
+
+#### 推流协议（浏览器 → 推流服务器）
+
+浏览器推流使用独立的 WebSocket 连接（端口 7778）：
+
+**配置消息（第1条）：**
+```
+[4 bytes: sps_length]  [sps]  [4 bytes: pps_length]  [pps]  [4 bytes: width]  [4 bytes: height]
+```
+
+**视频帧消息（第2条起）：**
+```
+[4 bytes: timestamp_ms]  [1 byte: is_keyframe(0/1)]  [H.264 AVCC 数据]
 ```
 
 ---
@@ -206,6 +237,8 @@ ffmpeg -f avfoundation -i "0" \
 #### 方式二：浏览器推流（WebSocket）
 
 访问 `https://localhost:7778/`（或你的服务器地址），直接使用浏览器摄像头推流。支持独立控制视频/音频的开启与关闭。
+
+> **特性：** 使用 WebCodecs VideoEncoder 硬件编码 H.264（avc1.42001e），自动**每 ~2 秒强制插入一个关键帧**，确保后连接的播放端能快速开始解码。
 
 ### 播放
 
@@ -435,12 +468,278 @@ carrot-streaming-media/
 │   ├── index.html                    # 播放器页面
 │   ├── push.html                     # 浏览器推流页面
 │   └── js/
-│       ├── player.js                 # WebCodecs 解码播放器
-│       └── pusher.js                 # 浏览器推流客户端
+│       ├── player.js                 # WebCodecs 解码播放器（向后兼容）
+│       ├── pusher.js                 # 浏览器推流客户端（向后兼容）
+│       └── carrot-sdk.js             # 前端 SDK（统一封装 Player + Pusher）
 ├── Dockerfile                        # Docker 构建
 ├── go.mod / go.sum                   # Go 依赖
 └── README.md
 ```
+
+---
+
+## 前端 SDK 使用说明
+
+`carrot-sdk.js` 封装了播放器（Player）和推流器（Pusher），提供统一的 `CarrotSDK` 命名空间，便于其他项目集成。
+
+### 引入方式
+
+```html
+<script src="js/carrot-sdk.js"></script>
+```
+
+SDK 会自动挂载到全局 `window.CarrotSDK`。
+
+### CarrotSDK.Player — 播放器
+
+用于播放 H.264 视频和 AAC 音频流。
+
+#### 快速开始
+
+```html
+<canvas id="myCanvas"></canvas>
+<div id="myStatus"></div>
+<script src="js/carrot-sdk.js"></script>
+<script>
+  const player = new CarrotSDK.Player({
+    canvas: 'myCanvas',
+    statusEl: 'myStatus',
+    videoUrl: 'live/stream',   // 视频流路径
+    audioUrl: 'live/stream',    // 音频流路径（可选，单独传参时合并）
+  });
+  player.connect();
+</script>
+```
+
+##### 连接外部服务器
+
+如果页面不部署在流媒体服务器上，需要指定服务器地址和端口：
+
+```javascript
+// 播放器：连接到远程流媒体服务器
+const player = new CarrotSDK.Player({
+  host: '192.168.1.100',          // 流媒体服务器 IP 或域名
+  port: 7777,                      // 流媒体服务器端口（播放端口）
+  videoUrl: 'live/stream',
+});
+player.connect();
+
+// 推流器：连接到远程推流服务器
+const pusher = new CarrotSDK.Pusher({
+  host: '192.168.1.100',          // 推流服务器 IP 或域名
+  port: 7778,                      // 推流服务器端口
+});
+pusher.startVideo('live/cam1');
+```
+
+#### 构造函数参数
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `canvas` | `HTMLElement\|string` | Canvas 元素或 ID |
+| `statusEl` | `HTMLElement\|string` | 状态栏元素或 ID |
+| `videoUrl` | `string` | 视频流路径（如 `live/stream`） |
+| `audioUrl` | `string` | 音频流路径（如 `audio/stream`） |
+| `host` | `string` | 服务器地址，默认当前页面 host |
+| `port` | `number` | 服务器端口，默认当前页面端口 |
+| `dataTimeout` | `number` | 数据超时阈值（ms），默认 `10000`（10秒）。超过此时间未收到数据则自动重连。设为 `0` 可禁用 |
+| `onStatus` | `function(msg, type)` | 状态回调 |
+| `onStats` | `function(stats)` | 统计信息回调 |
+| `onFrame` | `function(VideoFrame)` | 每帧回调 |
+
+#### 方法
+
+| 方法 | 说明 |
+|------|------|
+| `connect(videoUrl?, audioUrl?)` | 连接并开始播放（可覆盖构造时的 URL） |
+| `disconnect()` | 断开连接并清理资源 |
+| `destroy()` | 同 `disconnect()` |
+
+#### 分离音视频流
+
+```javascript
+// 视频和音频走不同流路径
+const player = new CarrotSDK.Player({
+  videoUrl: 'live/camera1',
+  audioUrl: 'audio/mic1',
+});
+player.connect();
+```
+
+#### 纯音频 / 纯视频
+
+```javascript
+// 仅视频
+const player = new CarrotSDK.Player({ videoUrl: 'live/stream' });
+player.connect();
+
+// 仅音频
+const player = new CarrotSDK.Player({ audioUrl: 'audio/stream' });
+player.connect();
+```
+
+#### 事件回调示例
+
+```javascript
+const player = new CarrotSDK.Player({
+  videoUrl: 'live/stream',
+  onStatus: function(msg, type) {
+    console.log('状态:', msg, '类型:', type);
+    // type: 'connected' | 'error' | ''
+  },
+  onStats: function(stats) {
+    console.log('统计:', stats);
+    // { fps, frameCount, decodedCount, droppedCount, latency, audioDecodedFrames }
+  },
+  onFrame: function(frame) {
+    // 每次解码出一帧时调用
+    console.log('新帧:', frame.displayWidth, 'x', frame.displayHeight);
+  }
+});
+player.connect();
+```
+
+---
+
+### CarrotSDK.Pusher — 推流器
+
+用于浏览器端推送 H.264 视频和 AAC 音频到服务器。
+
+#### 快速开始
+
+```html
+<video id="preview" autoplay muted playsinline></video>
+<script src="js/carrot-sdk.js"></script>
+<script>
+  const pusher = new CarrotSDK.Pusher();
+  
+  // 推流视频
+  pusher.startVideo('video/browser');
+  
+  // 推流音频
+  pusher.startAudio('audio/browser');
+  
+  // 停止所有推流
+  // pusher.stopAll();
+</script>
+```
+
+#### 构造函数参数
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `host` | `string` | 推流服务器地址，默认当前页面 host |
+| `port` | `number` | 推流服务器端口，默认 `7778` |
+| `video.streamUrl` | `string` | 视频流路径 |
+| `video.host` | `string` | 视频推流服务器地址（覆盖全局 host） |
+| `video.port` | `number` | 视频推流端口（覆盖全局 port） |
+| `video.constraints` | `Object` | `getUserMedia` 视频约束 |
+| `video.preview` | `HTMLElement\|string` | 预览 `<video>` 元素或 ID |
+| `audio.streamUrl` | `string` | 音频流路径 |
+| `audio.host` | `string` | 音频推流服务器地址（覆盖全局 host） |
+| `audio.port` | `number` | 音频推流端口（覆盖全局 port） |
+| `audio.constraints` | `Object` | `getUserMedia` 音频约束 |
+| `onStatus` | `function(type, msg)` | 状态回调 |
+| `onStats` | `function(stats)` | 统计信息回调 |
+
+```javascript
+const pusher = new CarrotSDK.Pusher({
+  host: '192.168.1.100',        // 推流服务器地址（可选）
+  port: 7778,                    // 推流服务器端口（可选）
+  // 视频配置
+  video: {
+    streamUrl: 'video/browser',
+    // host: '10.0.0.1',        // 可覆盖全局 host
+    // port: 7778,              // 可覆盖全局 port
+    constraints: {
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24 } }
+    },
+    preview: 'preview',
+    streamUrlEl: 'videoStreamUrl',
+    btnStartEl: 'btnVideoStart',
+    btnStopEl: 'btnVideoStop',
+    statusEl: 'videoStatus',
+    statsEl: 'videoStats',
+  },
+  // 音频配置
+  audio: {
+    streamUrl: 'audio/browser',
+    constraints: {
+      audio: { sampleRate: 44100, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    },
+    streamUrlEl: 'audioStreamUrl',
+    btnStartEl: 'btnAudioStart',
+    btnStopEl: 'btnAudioStop',
+    statusEl: 'audioStatus',
+    statsEl: 'audioStats',
+  },
+  // 全局回调
+  onStatus: function(type, msg) {
+    console.log('[' + type + ']', msg);
+    // type: 'audio' | 'video'
+  },
+  onStats: function(stats) {
+    console.log(stats.type, '统计:', stats);
+    // { type, frameCount, bytesSent, pushing }
+  }
+});
+```
+
+#### 方法
+
+| 方法 | 说明 |
+|------|------|
+| `startAudio(streamUrl?)` | 开始音频推流 |
+| `stopAudio()` | 停止音频推流 |
+| `startVideo(streamUrl?)` | 开始视频推流 |
+| `stopVideo()` | 停止视频推流 |
+| `stopAll()` | 停止所有推流 |
+| `getStats()` | 获取当前统计数据 |
+
+#### 独立控制音视频
+
+```javascript
+const pusher = new CarrotSDK.Pusher();
+
+// 仅推视频
+pusher.startVideo('live/cam1');
+
+// 仅推音频
+pusher.startAudio('audio/mic1');
+
+// 获取实时统计
+const stats = pusher.getStats();
+console.log('视频帧数:', stats.video.frameCount, '音频帧数:', stats.audio.frameCount);
+
+// 停止视频，保留音频
+pusher.stopVideo();
+
+// 全部停止
+pusher.stopAll();
+```
+
+---
+
+### 从 URL 参数自动初始化（播放器）
+
+`CarrotSDK.Player` 兼容原有的 URL 参数方式，无需额外 JavaScript 代码即可工作：
+
+```
+https://localhost:7777/?videoUrl=live/stream&audioUrl=audio/stream
+
+# 自定义数据超时（15秒无数据重连）
+https://localhost:7777/?videoUrl=live/stream&dataTimeout=15000
+```
+
+支持 URL 参数：
+
+| 参数 | 说明 |
+|------|------|
+| `videoUrl` 或 `url` | 视频流路径 |
+| `audioUrl` | 音频流路径（可选，如不指定则与视频同路径） |
+| `dataTimeout` | 数据超时阈值（ms），默认 `10000` |
+
+只需在页面中引入 SDK 并保留对应 ID 的 HTML 元素即可自动初始化。
 
 ---
 
@@ -474,6 +773,11 @@ WebSocket connection to 'wss://localhost:7777/ws?url=live/stream' failed
 2. 打开浏览器控制台，检查是否有 `VideoDecoder is not defined` 错误
 3. 确认推流参数包含 `-pix_fmt yuv420p`
 4. 确认 `?xxxUrl=` 参数值与推流路径一致
+5. **浏览器推流无画面**：
+   - 打开推流页和播放页的浏览器控制台，查看是否有配置解析失败的日志
+   - 检查 `[CarrotSDK Video]` 相关的日志，确认 config 是否成功提取和发送
+   - 检查 `[CarrotSDK Player]` 相关的日志，确认是否收到 config 和解码帧
+6. **播放端断流卡死**：播放器内置数据超时检测（默认10秒），无数据时自动重连。可通过 `dataTimeout` 参数调整阈值
 
 ### 解码错误
 

@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net/http"
@@ -172,11 +173,16 @@ func (s *Server) handleConnection(conn *gorilla.Conn, connID string, stream *med
 	if wantsVideo {
 		configMsg := stream.BuildCodecConfigMessage()
 		if configMsg != nil {
+			log.Printf("[WebSocket] Sending video config to %s (%d bytes)", connID, len(configMsg))
 			if err := conn.WriteMessage(gorilla.BinaryMessage, configMsg); err != nil {
 				log.Printf("[WebSocket] Failed to send video config to %s: %v", connID, err)
 				return
 			}
-			log.Printf("[WebSocket] Sent video codec config to %s", connID)
+			log.Printf("[WebSocket] Sent video codec config to %s (msgType=%d, payloadLen=%d)",
+				connID, binary.BigEndian.Uint32(configMsg[0:4]), binary.BigEndian.Uint32(configMsg[8:12]))
+		} else {
+			log.Printf("[WebSocket] WARNING: No video config available for %s (hasConfig=%v)",
+				connID, stream.HasConfig())
 		}
 	}
 
@@ -196,8 +202,9 @@ func (s *Server) handleConnection(conn *gorilla.Conn, connID string, stream *med
 	sub := stream.AddSubscriber(connID, wantsVideo, wantsAudio)
 	defer stream.RemoveSubscriber(connID)
 
-	log.Printf("[WebSocket] Started sending stream data to %s", connID)
+	log.Printf("[WebSocket] %s: subscribed, waiting for frames. Stream has %d subscribers", connID, stream.SubscriberCount())
 
+	var frameCount int
 	for {
 		select {
 		case <-sub.Done:
@@ -212,6 +219,13 @@ func (s *Server) handleConnection(conn *gorilla.Conn, connID string, stream *med
 			if err := conn.WriteMessage(gorilla.BinaryMessage, frame); err != nil {
 				log.Printf("[WebSocket] Write error to %s: %v", connID, err)
 				return
+			}
+			frameCount++
+			if frameCount <= 3 || frameCount%100 == 0 {
+				msgType := binary.BigEndian.Uint32(frame[0:4])
+				payloadLen := binary.BigEndian.Uint32(frame[8:12])
+				log.Printf("[WebSocket] Forwarded frame #%d to %s: msgType=%d payloadLen=%d totalLen=%d",
+					frameCount, connID, msgType, payloadLen, len(frame))
 			}
 		}
 	}
