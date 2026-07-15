@@ -6,13 +6,22 @@ import (
 	"time"
 
 	"github.com/nareix/joy4/av"
+	"github.com/nareix/joy4/codec/aacparser"
 	"github.com/nareix/joy4/codec/h264parser"
 )
 
-// Message types for WebTransport/WebSocket data
+// Message types for WebSocket data
 const (
 	MsgTypeCodecConfig = 0
 	MsgTypeVideoFrame  = 1
+	MsgTypeAudioConfig = 2
+	MsgTypeAudioFrame  = 3
+)
+
+// Audio codec types (used in audio config message)
+const (
+	AudioCodecAAC = 0
+	AudioCodecMP3 = 1
 )
 
 // Frame types
@@ -23,17 +32,26 @@ const (
 
 // Subscriber represents a session that receives stream data
 type Subscriber struct {
-	VideoChan chan []byte
-	Done      chan struct{}
+	FrameChan  chan []byte
+	Done       chan struct{}
+	WantsVideo bool
+	WantsAudio bool
 }
 
 // Stream represents a single stream identified by path (e.g. "live/stream")
 type Stream struct {
-	mu            sync.RWMutex
-	subscribers   map[string]*Subscriber
+	mu          sync.RWMutex
+	subscribers map[string]*Subscriber
+	// Video
 	sps, pps      []byte
 	width, height int
 	hasConfig     bool
+	// Audio
+	audioCodecType  byte // AudioCodecAAC or AudioCodecMP3
+	sampleRate      int
+	channels        int
+	audioConfigData []byte // AudioSpecificConfig for AAC (codec-specific config)
+	hasAudioConfig  bool
 }
 
 // NewStream creates a new Stream
@@ -64,7 +82,34 @@ func (s *Stream) UpdateCodecConfig(codecs []av.CodecData) error {
 	return nil
 }
 
-// BuildCodecConfigMessage builds the codec configuration message
+// UpdateAudioCodecConfig extracts audio codec configuration from stream codecs
+func (s *Stream) UpdateAudioCodecConfig(codecs []av.CodecData) error {
+	for _, codec := range codecs {
+		if codec.Type().IsAudio() {
+			if ac, ok := codec.(av.AudioCodecData); ok {
+				s.sampleRate = ac.SampleRate()
+				s.channels = ac.ChannelLayout().Count()
+
+				switch {
+				case ac.Type() == av.AAC:
+					s.audioCodecType = AudioCodecAAC
+					if aacCD, ok := ac.(aacparser.CodecData); ok {
+						configBytes := aacCD.MPEG4AudioConfigBytes()
+						s.audioConfigData = make([]byte, len(configBytes))
+						copy(s.audioConfigData, configBytes)
+					}
+				default:
+					s.audioCodecType = AudioCodecMP3
+				}
+
+				s.hasAudioConfig = true
+			}
+		}
+	}
+	return nil
+}
+
+// BuildCodecConfigMessage builds the video codec configuration message
 func (s *Stream) BuildCodecConfigMessage() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -105,7 +150,50 @@ func (s *Stream) BuildCodecConfigMessage() []byte {
 	return msg
 }
 
-// BroadcastVideoPacket broadcasts a video packet to all subscribers of this stream
+// BuildAudioCodecConfigMessage builds the audio codec configuration message
+func (s *Stream) BuildAudioCodecConfigMessage() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if !s.hasAudioConfig {
+		return nil
+	}
+
+	// Message format:
+	// [4 bytes: message_type=2]
+	// [4 bytes: timestamp=0]
+	// [4 bytes: payload_length]
+	// payload: [1 byte: codec_type] (0=AAC, 1=MP3)
+	//          [4 bytes: sample_rate] (int32 big-endian)
+	//          [1 byte: channels]
+	//          [variable: codec-specific config data]
+	//            For AAC: AudioSpecificConfig bytes
+	//            For MP3: empty
+
+	configDataLen := len(s.audioConfigData)
+	payloadLen := 1 + 4 + 1 + configDataLen
+	msgLen := 4 + 4 + 4 + payloadLen
+
+	msg := make([]byte, msgLen)
+	binary.BigEndian.PutUint32(msg[0:4], MsgTypeAudioConfig)
+	binary.BigEndian.PutUint32(msg[4:8], 0) // timestamp
+	binary.BigEndian.PutUint32(msg[8:12], uint32(payloadLen))
+
+	offset := 12
+	msg[offset] = s.audioCodecType
+	offset++
+	binary.BigEndian.PutUint32(msg[offset:offset+4], uint32(s.sampleRate))
+	offset += 4
+	msg[offset] = byte(s.channels)
+	offset++
+	if configDataLen > 0 {
+		copy(msg[offset:offset+configDataLen], s.audioConfigData)
+	}
+
+	return msg
+}
+
+// BroadcastVideoPacket broadcasts a video packet to subscribers that want video
 func (s *Stream) BroadcastVideoPacket(pkt av.Packet) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -132,9 +220,125 @@ func (s *Stream) BroadcastVideoPacket(pkt av.Packet) {
 	msg[12] = byte(frameType)
 	copy(msg[13:], pkt.Data)
 
+	s.broadcastVideoToSubscribers(msg)
+}
+
+// BroadcastAudioPacket broadcasts an audio packet to subscribers that want audio
+func (s *Stream) BroadcastAudioPacket(pkt av.Packet) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.subscribers) == 0 {
+		return
+	}
+
+	timestampMs := uint32(pkt.Time / time.Millisecond)
+
+	// Message format:
+	// [4 bytes: message_type=3]
+	// [4 bytes: timestamp_ms]
+	// [4 bytes: payload_length]
+	// payload: [raw audio frame data]
+	//   For AAC: raw AAC frame (no ADTS header)
+	//   For MP3: raw MP3 frame
+
+	payloadLen := len(pkt.Data)
+	msgLen := 4 + 4 + 4 + payloadLen
+	msg := make([]byte, msgLen)
+
+	binary.BigEndian.PutUint32(msg[0:4], MsgTypeAudioFrame)
+	binary.BigEndian.PutUint32(msg[4:8], timestampMs)
+	binary.BigEndian.PutUint32(msg[8:12], uint32(payloadLen))
+	copy(msg[12:], pkt.Data)
+
+	s.broadcastAudioToSubscribers(msg)
+}
+
+// BroadcastAudioData broadcasts raw audio frame data to subscribers that want audio.
+// Unlike BroadcastAudioPacket, this accepts raw bytes directly (for browser-pushed audio).
+func (s *Stream) BroadcastAudioData(data []byte, timestampMs uint32) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.subscribers) == 0 {
+		return
+	}
+
+	payloadLen := len(data)
+	msgLen := 4 + 4 + 4 + payloadLen
+	msg := make([]byte, msgLen)
+
+	binary.BigEndian.PutUint32(msg[0:4], MsgTypeAudioFrame)
+	binary.BigEndian.PutUint32(msg[4:8], timestampMs)
+	binary.BigEndian.PutUint32(msg[8:12], uint32(payloadLen))
+	copy(msg[12:], data)
+
+	s.broadcastAudioToSubscribers(msg)
+}
+
+// SetAudioConfig sets audio codec config from known parameters (for browser pushes).
+func (s *Stream) SetAudioConfig(codecType byte, sampleRate int, channels int, configData []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.audioCodecType = codecType
+	s.sampleRate = sampleRate
+	s.channels = channels
+	s.audioConfigData = make([]byte, len(configData))
+	copy(s.audioConfigData, configData)
+	s.hasAudioConfig = true
+}
+
+// SetVideoConfig sets video codec config from known parameters (for browser pushes).
+func (s *Stream) SetVideoConfig(sps, pps []byte, width, height int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.sps = make([]byte, len(sps))
+	copy(s.sps, sps)
+	s.pps = make([]byte, len(pps))
+	copy(s.pps, pps)
+	s.width = width
+	s.height = height
+	s.hasConfig = true
+}
+
+// BroadcastVideoData broadcasts raw H.264 video frame data to subscribers that want video.
+// Unlike BroadcastVideoPacket, this accepts raw bytes directly (for browser-pushed video).
+func (s *Stream) BroadcastVideoData(data []byte, timestampMs uint32, isKeyFrame bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.subscribers) == 0 {
+		return
+	}
+
+	frameType := FrameTypeDelta
+	if isKeyFrame {
+		frameType = FrameTypeKeyFrame
+	}
+
+	payloadLen := 1 + len(data)
+	msgLen := 4 + 4 + 4 + payloadLen
+	msg := make([]byte, msgLen)
+
+	binary.BigEndian.PutUint32(msg[0:4], MsgTypeVideoFrame)
+	binary.BigEndian.PutUint32(msg[4:8], timestampMs)
+	binary.BigEndian.PutUint32(msg[8:12], uint32(payloadLen))
+	msg[12] = byte(frameType)
+	copy(msg[13:], data)
+
+	s.broadcastVideoToSubscribers(msg)
+}
+
+// broadcastVideoToSubscribers sends a message only to subscribers that want video
+func (s *Stream) broadcastVideoToSubscribers(msg []byte) {
 	for id, sub := range s.subscribers {
+		if !sub.WantsVideo {
+			continue
+		}
 		select {
-		case sub.VideoChan <- msg:
+		case sub.FrameChan <- msg:
 		case <-sub.Done:
 			delete(s.subscribers, id)
 		default:
@@ -143,11 +347,29 @@ func (s *Stream) BroadcastVideoPacket(pkt av.Packet) {
 	}
 }
 
-// AddSubscriber adds a new subscriber
-func (s *Stream) AddSubscriber(id string) *Subscriber {
+// broadcastAudioToSubscribers sends a message only to subscribers that want audio
+func (s *Stream) broadcastAudioToSubscribers(msg []byte) {
+	for id, sub := range s.subscribers {
+		if !sub.WantsAudio {
+			continue
+		}
+		select {
+		case sub.FrameChan <- msg:
+		case <-sub.Done:
+			delete(s.subscribers, id)
+		default:
+			// Channel full, skip this frame for slow subscriber
+		}
+	}
+}
+
+// AddSubscriber adds a new subscriber with specified media type preferences
+func (s *Stream) AddSubscriber(id string, wantsVideo, wantsAudio bool) *Subscriber {
 	sub := &Subscriber{
-		VideoChan: make(chan []byte, 120),
-		Done:      make(chan struct{}),
+		FrameChan:  make(chan []byte, 120),
+		Done:       make(chan struct{}),
+		WantsVideo: wantsVideo,
+		WantsAudio: wantsAudio,
 	}
 
 	s.mu.Lock()
@@ -167,11 +389,18 @@ func (s *Stream) RemoveSubscriber(id string) {
 	s.mu.Unlock()
 }
 
-// HasConfig returns whether codec config is available
+// HasConfig returns whether video codec config is available
 func (s *Stream) HasConfig() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.hasConfig
+}
+
+// HasAudioConfig returns whether audio codec config is available
+func (s *Stream) HasAudioConfig() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.hasAudioConfig
 }
 
 // GetStreamInfo returns stream information

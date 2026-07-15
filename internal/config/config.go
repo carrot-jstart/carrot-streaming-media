@@ -14,8 +14,9 @@ type Config struct {
 	SSLKey  string
 
 	// Server ports
-	HTTPPort int
-	RTMPPort int
+	HTTPPort   int
+	RTMPPort   int
+	WsPushPort int
 
 	// Web static files directory
 	WebDir string
@@ -33,12 +34,13 @@ func Load(path string) (*Config, error) {
 
 	cfg := &Config{
 		// defaults
-		SSLCert:  "./cert/localhost+3.pem",
-		SSLKey:   "./cert/localhost+3-key.pem",
-		HTTPPort: 8080,
-		RTMPPort: 1935,
-		WebDir:   "./web",
-		LogLevel: "info",
+		SSLCert:    "./cert/localhost+3.pem",
+		SSLKey:     "./cert/localhost+3-key.pem",
+		HTTPPort:   8080,
+		RTMPPort:   1935,
+		WsPushPort: 7778,
+		WebDir:     "./web",
+		LogLevel:   "info",
 	}
 
 	lines := strings.Split(string(data), "\n")
@@ -86,6 +88,12 @@ func (cfg *Config) setField(key, val string, lineNum int) error {
 			return fmt.Errorf("line %d: invalid rtmp_port '%s'", lineNum, val)
 		}
 		cfg.RTMPPort = port
+	case "ws_push_port":
+		port, err := strconv.Atoi(val)
+		if err != nil {
+			return fmt.Errorf("line %d: invalid push_port '%s'", lineNum, val)
+		}
+		cfg.WsPushPort = port
 	case "web_dir":
 		cfg.WebDir = val
 	case "log_level":
@@ -104,7 +112,7 @@ func (cfg *Config) setField(key, val string, lineNum int) error {
 
 func (cfg *Config) String() string {
 	return fmt.Sprintf(
-		"HTTP:%d RTMP:%d cert:%s web:%s log:%s",
-		cfg.HTTPPort, cfg.RTMPPort, cfg.SSLCert, cfg.WebDir, cfg.LogLevel,
+		"HTTP:%d RTMP:%d Push:%d cert:%s web:%s log:%s",
+		cfg.HTTPPort, cfg.RTMPPort, cfg.WsPushPort, cfg.SSLCert, cfg.WebDir, cfg.LogLevel,
 	)
 }

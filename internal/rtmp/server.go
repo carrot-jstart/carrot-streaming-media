@@ -63,21 +63,36 @@ func (s *Server) Start() error {
 			return
 		}
 
-		// Update codec configuration
+		// Update video codec configuration
 		if err := stream.UpdateCodecConfig(codecs); err != nil {
-			log.Printf("[RTMP] Failed to update codec config: %v", err)
+			log.Printf("[RTMP] Failed to update video codec config: %v", err)
 		}
 
-		log.Printf("[RTMP] Stream codecs: %d streams", len(codecs))
-		for _, codec := range codecs {
-			if codec.Type().IsVideo() {
-				if vc, ok := codec.(av.VideoCodecData); ok {
-					log.Printf("[RTMP]   Video: %dx%d", vc.Width(), vc.Height())
+		// Update audio codec configuration
+		if err := stream.UpdateAudioCodecConfig(codecs); err != nil {
+			log.Printf("[RTMP] Failed to update audio codec config: %v", err)
+		}
+
+		// Build index maps for routing packets by stream index
+		// pkt.Idx corresponds to the index in the codecs slice
+		isVideoIdx := make(map[int8]bool)
+		isAudioIdx := make(map[int8]bool)
+		for i, c := range codecs {
+			if c.Type().IsVideo() {
+				isVideoIdx[int8(i)] = true
+				if vc, ok := c.(av.VideoCodecData); ok {
+					log.Printf("[RTMP]   Video stream[%d]: %dx%d", i, vc.Width(), vc.Height())
 				}
-			} else if codec.Type().IsAudio() {
-				log.Printf("[RTMP]   Audio codec")
+			} else if c.Type().IsAudio() {
+				isAudioIdx[int8(i)] = true
+				if ac, ok := c.(av.AudioCodecData); ok {
+					log.Printf("[RTMP]   Audio stream[%d]: %d Hz, %d channels", i, ac.SampleRate(), ac.ChannelLayout().Count())
+				}
 			}
 		}
+
+		log.Printf("[RTMP] Stream codecs: %d streams (%d video, %d audio)",
+			len(codecs), len(isVideoIdx), len(isAudioIdx))
 
 		// Read and broadcast packets
 		for {
@@ -87,9 +102,10 @@ func (s *Server) Start() error {
 				break
 			}
 
-			// Broadcast video packets (audio packets are ignored for now)
-			if pkt.Idx == 0 {
+			if isVideoIdx[pkt.Idx] {
 				stream.BroadcastVideoPacket(pkt)
+			} else if isAudioIdx[pkt.Idx] {
+				stream.BroadcastAudioPacket(pkt)
 			}
 		}
 

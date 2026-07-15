@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Media Push - Carrot Streaming</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0d1117;
+            color: #e6edf3;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .container {
+            max-width: 900px;
+            width: 100%;
+            padding: 24px;
+        }
+
+        h1 {
+            font-size: 22px;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+
+        .subtitle {
+            color: #8b949e;
+            font-size: 13px;
+            margin-bottom: 24px;
+        }
+
+        .row {
+            display: flex;
+            gap: 20px;
+        }
+
+        .card {
+            flex: 1;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 20px;
+        }
+
+        .card-title {
+            font-size: 15px;
+            font-weight: 600;
+            margin-bottom: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .card-title .badge {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 500;
+        }
+
+        .badge-audio {
+            background: #1f6feb22;
+            color: #58a6ff;
+            border: 1px solid #1f6feb44;
+        }
+
+        .badge-video {
+            background: #3fb95022;
+            color: #3fb950;
+            border: 1px solid #3fb95044;
+        }
+
+        .form-group {
+            margin-bottom: 12px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 12px;
+            color: #8b949e;
+            margin-bottom: 4px;
+        }
+
+        input[type="text"] {
+            width: 100%;
+            padding: 8px 12px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            color: #e6edf3;
+            font-size: 13px;
+            outline: none;
+            transition: border-color .2s;
+        }
+
+        input[type="text"]:focus {
+            border-color: #58a6ff;
+        }
+
+        input[type="text"]:disabled {
+            opacity: .5;
+        }
+
+        .btn-row {
+            display: flex;
+            gap: 8px;
+            margin: 12px 0 8px;
+        }
+
+        button {
+            padding: 7px 18px;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all .15s;
+            background: #21262d;
+            color: #e6edf3;
+        }
+
+        button:hover:not(:disabled) {
+            background: #30363d;
+        }
+
+        button:disabled {
+            opacity: .4;
+            cursor: default;
+        }
+
+        .btn-start {
+            background: #238636;
+            border-color: #2ea043;
+        }
+
+        .btn-start:hover:not(:disabled) {
+            background: #2ea043;
+        }
+
+        .btn-stop {
+            background: #da3633;
+            border-color: #f85149;
+        }
+
+        .btn-stop:hover:not(:disabled) {
+            background: #f85149;
+        }
+
+        .status {
+            font-size: 12px;
+            color: #8b949e;
+            min-height: 1.2em;
+        }
+
+        .stats {
+            font-size: 12px;
+            color: #58a6ff;
+            min-height: 1.2em;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .divider {
+            border: none;
+            border-top: 1px solid #30363d;
+            margin: 20px 0;
+        }
+
+        #preview {
+            width: 100%;
+            max-width: 640px;
+            border-radius: 8px;
+            display: none;
+            background: #000;
+            margin-top: 8px;
+        }
+
+        .footer {
+            text-align: center;
+            margin-top: 20px;
+            font-size: 12px;
+            color: #484f58;
+        }
+
+        @media (max-width: 640px) {
+            .row {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>&#127909; Media Push</h1>
+        <p class="subtitle">通过浏览器实时推送音视频流到服务器</p>
+
+        <div class="row">
+            <!-- Audio -->
+            <div class="card">
+                <div class="card-title">
+                    &#127897; 音频推送
+                    <span class="badge badge-audio">AAC</span>
+                </div>
+                <div class="form-group">
+                    <label for="audioStreamUrl">流路径</label>
+                    <input type="text" id="audioStreamUrl" value="audio/browser">
+                </div>
+                <div class="btn-row">
+                    <button class="btn-start" id="btnAudioStart">开始</button>
+                    <button class="btn-stop" id="btnAudioStop" disabled>停止</button>
+                </div>
+                <div class="status" id="audioStatus"></div>
+                <div class="stats" id="audioStats"></div>
+            </div>
+
+            <!-- Video -->
+            <div class="card">
+                <div class="card-title">
+                    &#127916; 视频推送
+                    <span class="badge badge-video">H.264</span>
+                </div>
+                <div class="form-group">
+                    <label for="videoStreamUrl">流路径</label>
+                    <input type="text" id="videoStreamUrl" value="video/browser">
+                </div>
+                <div class="btn-row">
+                    <button class="btn-start" id="btnVideoStart">开始</button>
+                    <button class="btn-stop" id="btnVideoStop" disabled>停止</button>
+                </div>
+                <div class="status" id="videoStatus"></div>
+                <div class="stats" id="videoStats"></div>
+                <video id="preview" autoplay muted playsinline style="margin-top:12px"></video>
+            </div>
+        </div>
+
+        <hr class="divider">
+        <p class="footer">Carrot Streaming Media — 支持独立开启/停止音频和视频推送</p>
+    </div>
+
+    <script src="js/pusher.js"></script>
+</body>
+
+</html>

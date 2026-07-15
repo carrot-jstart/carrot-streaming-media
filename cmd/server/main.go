@@ -57,6 +57,13 @@ func main() {
 	}
 	log.Printf("WebSocket server listening on :%d (HTTPS/WSS)", cfg.HTTPPort)
 
+	// Create and start WebSocket push server (for browser audio/video push)
+	pushServer := ws.NewPushServer(strconv.Itoa(cfg.WsPushPort), streamMgr, tlsConfig, cfg.WebDir)
+	if err := pushServer.Start(); err != nil {
+		log.Fatalf("Failed to start push server: %v", err)
+	}
+	log.Printf("Push server listening on :%d (WS)", cfg.WsPushPort)
+
 	// Print usage instructions
 	printUsage(cfg)
 
@@ -68,6 +75,7 @@ func main() {
 	log.Println("Shutting down...")
 	rtmpServer.Stop()
 	wsServer.Stop()
+	pushServer.Stop()
 	log.Println("Server stopped")
 }
 
@@ -77,13 +85,27 @@ func printUsage(cfg *config.Config) {
 	fmt.Println("  Streaming Media Server is Running!")
 	fmt.Println("========================================")
 	fmt.Println()
-	fmt.Println("  Push Stream:")
+	fmt.Println("  Push Video Stream:")
 	fmt.Println("    ffmpeg -re -i <input> -c:v libx264 -preset ultrafast -tune zerolatency -g 30")
 	fmt.Println("           -c:a aac -ar 44100 -ac 2 -f flv")
 	fmt.Println("           rtmp://localhost:" + strconv.Itoa(cfg.RTMPPort) + "/live/stream")
 	fmt.Println()
-	fmt.Println("  Playback:")
-	fmt.Println("    https://localhost:" + strconv.Itoa(cfg.HTTPPort) + "/?url=live/stream")
+	fmt.Println("  Push Audio-only Stream (low latency):")
+	fmt.Println("    ffmpeg -fflags nobuffer -flags low_delay -f dshow -i audio=\"Microphone\"")
+	fmt.Println("           -c:a aac -b:a 128k -ar 44100 -ac 2 -f flv")
+	fmt.Println("           rtmp://localhost:" + strconv.Itoa(cfg.RTMPPort) + "/audio/stream")
+	fmt.Println()
+	fmt.Println("  Playback (combined):")
+	fmt.Println("    https://localhost:" + strconv.Itoa(cfg.HTTPPort) + "/?videoUrl=live/stream&audioUrl=audio/stream")
+	fmt.Println()
+	fmt.Println("  Playback (video only):")
+	fmt.Println("    https://localhost:" + strconv.Itoa(cfg.HTTPPort) + "/?videoUrl=live/stream")
+	fmt.Println()
+	fmt.Println("  Playback (audio only):")
+	fmt.Println("    https://localhost:" + strconv.Itoa(cfg.HTTPPort) + "/?audioUrl=audio/stream")
+	fmt.Println()
+	fmt.Println("  Browser Media Push (WebSocket):")
+	fmt.Println("    http://localhost:" + strconv.Itoa(cfg.WsPushPort) + "/push.html")
 	fmt.Println()
 	fmt.Println("========================================")
 	fmt.Println()

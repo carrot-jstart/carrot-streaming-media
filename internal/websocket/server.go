@@ -100,33 +100,66 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.connCount.Add(1)
 	connID := fmt.Sprintf("ws-%d", s.connCount.Load())
 
-	// Parse stream URL from query parameter
-	streamURL := r.URL.Query().Get("url")
-	if streamURL == "" {
-		log.Printf("[WebSocket] %s from %s rejected: missing url parameter", connID, r.RemoteAddr)
+	// Parse stream URL parameters — support three modes:
+	//   videoUrl=xxx  → video-only connection
+	//   audioUrl=xxx  → audio-only connection
+	//   url=xxx       → combined video+audio (backwards compatibility)
+	videoURL := r.URL.Query().Get("videoUrl")
+	audioURL := r.URL.Query().Get("audioUrl")
+	combinedURL := r.URL.Query().Get("url")
+
+	var streamURL string
+	var wantsVideo, wantsAudio bool
+
+	switch {
+	case videoURL != "" && audioURL != "":
+		// Both specified individually — this is unusual; treat as two paths
+		log.Printf("[WebSocket] %s from %s: both videoUrl and audioUrl provided, using videoUrl=%s",
+			connID, r.RemoteAddr, videoURL)
+		streamURL = videoURL
+		wantsVideo = true
+	case videoURL != "":
+		streamURL = videoURL
+		wantsVideo = true
+		log.Printf("[WebSocket] %s from %s: video-only connection, url=%s", connID, r.RemoteAddr, streamURL)
+	case audioURL != "":
+		streamURL = audioURL
+		wantsAudio = true
+		log.Printf("[WebSocket] %s from %s: audio-only connection, url=%s", connID, r.RemoteAddr, streamURL)
+	case combinedURL != "":
+		streamURL = combinedURL
+		wantsVideo = true
+		wantsAudio = true
+		log.Printf("[WebSocket] %s from %s: combined connection, url=%s", connID, r.RemoteAddr, streamURL)
+	default:
+		log.Printf("[WebSocket] %s from %s rejected: missing url/videoUrl/audioUrl parameter", connID, r.RemoteAddr)
 		conn.WriteMessage(gorilla.CloseMessage, []byte("missing url parameter"))
 		conn.Close()
 		s.connCount.Add(-1)
 		return
 	}
-	log.Printf("[WebSocket] New connection: %s from %s, url=%s", connID, r.RemoteAddr, streamURL)
 
 	// Get or create the stream by path
 	stream := s.streamMgr.GetOrCreateStream(streamURL)
 
-	s.handleConnection(conn, connID, stream)
+	s.handleConnection(conn, connID, stream, wantsVideo, wantsAudio)
 }
 
 // handleConnection manages a single WebSocket connection for a specific stream
-func (s *Server) handleConnection(conn *gorilla.Conn, connID string, stream *media.Stream) {
+func (s *Server) handleConnection(conn *gorilla.Conn, connID string, stream *media.Stream, wantsVideo, wantsAudio bool) {
 	defer func() {
 		s.connCount.Add(-1)
 		conn.Close()
 	}()
 
-	// Wait for codec config to be available
+	// Wait for relevant codec config(s) to be ready
 	waitStart := time.Now()
-	for !stream.HasConfig() {
+	for {
+		videoReady := !wantsVideo || stream.HasConfig()
+		audioReady := !wantsAudio || stream.HasAudioConfig()
+		if videoReady && audioReady {
+			break
+		}
 		if time.Since(waitStart) > 30*time.Second {
 			log.Printf("[WebSocket] Timeout waiting for stream config for %s", connID)
 			conn.WriteMessage(gorilla.CloseMessage, []byte("timeout waiting for stream"))
@@ -135,27 +168,41 @@ func (s *Server) handleConnection(conn *gorilla.Conn, connID string, stream *med
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Send codec config first
-	configMsg := stream.BuildCodecConfigMessage()
-	if configMsg != nil {
-		if err := conn.WriteMessage(gorilla.BinaryMessage, configMsg); err != nil {
-			log.Printf("[WebSocket] Failed to send config to %s: %v", connID, err)
-			return
+	// Send video codec config if this connection wants video
+	if wantsVideo {
+		configMsg := stream.BuildCodecConfigMessage()
+		if configMsg != nil {
+			if err := conn.WriteMessage(gorilla.BinaryMessage, configMsg); err != nil {
+				log.Printf("[WebSocket] Failed to send video config to %s: %v", connID, err)
+				return
+			}
+			log.Printf("[WebSocket] Sent video codec config to %s", connID)
 		}
-		log.Printf("[WebSocket] Sent codec config to %s", connID)
 	}
 
-	// Register as subscriber
-	sub := stream.AddSubscriber(connID)
+	// Send audio codec config if this connection wants audio
+	if wantsAudio {
+		audioConfigMsg := stream.BuildAudioCodecConfigMessage()
+		if audioConfigMsg != nil {
+			if err := conn.WriteMessage(gorilla.BinaryMessage, audioConfigMsg); err != nil {
+				log.Printf("[WebSocket] Failed to send audio config to %s: %v", connID, err)
+				return
+			}
+			log.Printf("[WebSocket] Sent audio codec config to %s", connID)
+		}
+	}
+
+	// Register as subscriber with the appropriate preferences
+	sub := stream.AddSubscriber(connID, wantsVideo, wantsAudio)
 	defer stream.RemoveSubscriber(connID)
 
-	log.Printf("[WebSocket] Started sending video to %s", connID)
+	log.Printf("[WebSocket] Started sending stream data to %s", connID)
 
 	for {
 		select {
 		case <-sub.Done:
 			return
-		case frame, ok := <-sub.VideoChan:
+		case frame, ok := <-sub.FrameChan:
 			if !ok {
 				return
 			}
