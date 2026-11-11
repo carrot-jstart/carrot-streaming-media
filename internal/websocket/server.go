@@ -24,13 +24,14 @@ var upgrader = gorilla.Upgrader{
 
 // Server handles WebSocket connections for browser streaming
 type Server struct {
-	streamMgr *media.StreamManager
-	port      string
-	connCount atomic.Int32
-	connSeq   atomic.Uint64
-	server    *http.Server
-	tlsConfig *tls.Config // nil = plain HTTP
-	webDir    string      // web static files directory
+	streamMgr  *media.StreamManager
+	port       string
+	connCount  atomic.Int32
+	connSeq    atomic.Uint64
+	server     *http.Server
+	tlsConfig  *tls.Config        // nil = plain HTTP
+	webDir     string             // web static files directory
+	timeSource func() serverClock // test seam; nil queries the local clock
 }
 
 // NewServer creates a new WebSocket streaming server
@@ -46,17 +47,21 @@ func NewServer(port string, streamMgr *media.StreamManager, tlsConfig *tls.Confi
 }
 
 // Start starts the WebSocket server
-func (s *Server) Start() error {
+func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.handleWebSocket)
+	mux.HandleFunc("/api/time", s.handleTime)
 
 	// Also serve web files for easy access via HTTP
 	fs := http.FileServer(http.Dir(s.webDir))
 	mux.Handle("/", fs)
+	return mux
+}
 
+func (s *Server) Start() error {
 	s.server = &http.Server{
 		Addr:      ":" + s.port,
-		Handler:   mux,
+		Handler:   s.handler(),
 		TLSConfig: s.tlsConfig,
 	}
 

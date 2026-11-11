@@ -585,9 +585,7 @@ class StreamPlayer {
             this.fpsLastCheck = now;
         }
 
-        const latency = this.lastFrameTime > 0
-            ? ` ${(now - this.lastFrameTime).toFixed(0)}ms`
-            : '';
+        const latency = ' | 取帧→绘制:--（旧版播放器，请使用 CarrotSDK v1.1.0）';
 
         const audioInfo = this.audioConfig
             ? ` | 音频:${this.audioDecodedFrames}帧`

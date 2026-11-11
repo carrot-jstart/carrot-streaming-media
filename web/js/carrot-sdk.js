@@ -1,5 +1,5 @@
 /**
- * CarrotSDK v1.0.0
+ * CarrotSDK v1.1.0
  * Unified SDK for Carrot Streaming Media
  * 
  * Provides:
@@ -18,17 +18,60 @@
 (function () {
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
 
     // ========================================================================
     //  Utility helpers
     // ========================================================================
 
     function readUint32(buffer, offset) {
-        return (buffer[offset] << 24) |
+        return ((buffer[offset] << 24) |
             (buffer[offset + 1] << 16) |
             (buffer[offset + 2] << 8) |
-            buffer[offset + 3];
+            buffer[offset + 3]) >>> 0;
+    }
+
+
+    // Read the vehicle's versioned H.264 user_data_unregistered timestamp.
+    function captureStamp(avcc) {
+        var uuid = [183, 229, 74, 216, 154, 49, 77, 247, 184, 221, 135, 172, 110, 41, 204, 113];
+        var pos = 0;
+        while (pos + 4 <= avcc.length) {
+            var length = readUint32(avcc, pos); pos += 4;
+            if (!length || length > avcc.length - pos) return null;
+            var end = pos + length;
+            if ((avcc[pos] & 31) === 6 && length <= 4096) {
+                var rbsp = [], zeros = 0;
+                for (var i = pos + 1; i < end; i++) {
+                    var b = avcc[i];
+                    if (zeros >= 2 && b === 3) {
+                        if (i + 1 >= end || avcc[i + 1] > 3) return null;
+                        zeros = 0; continue;
+                    }
+                    rbsp.push(b); zeros = b === 0 ? zeros + 1 : 0;
+                }
+                var at = 0;
+                while (at < rbsp.length && !(rbsp[at] === 128 && at + 1 === rbsp.length)) {
+                    var type = 0, size = 0;
+                    while (at < rbsp.length && rbsp[at] === 255) { type += 255; at++; }
+                    if (at >= rbsp.length) return null;
+                    type += rbsp[at++];
+                    while (at < rbsp.length && rbsp[at] === 255) { size += 255; at++; }
+                    if (at >= rbsp.length) return null;
+                    size += rbsp[at++];
+                    if (size > rbsp.length - at) return null;
+                    if (type === 5 && size === 30 && uuid.every(function (v, n) { return rbsp[at + n] === v; }) && rbsp[at + 16] === 1) {
+                        var captureMs = readUint32(rbsp, at + 18) * 4294967296 + readUint32(rbsp, at + 22);
+                        var clockError = readUint32(rbsp, at + 26);
+                        if (captureMs < 1577836800000 || captureMs > 4102444800000 || clockError > 1000) return null;
+                        return { unixMs: captureMs, synchronized: (rbsp[at + 17] & 1) !== 0, errorMs: clockError };
+                    }
+                    at += size;
+                }
+            }
+            pos = end;
+        }
+        return null;
     }
 
     /** Resolve a DOM element from an element, id string, or null */
@@ -89,6 +132,13 @@
         this.decodedCount = 0;
         this.droppedCount = 0;
         this.lastFrameTime = 0;
+        this._frameTimings = new Map();
+        this._receiveToRenderMs = this._endToEndLatencyMs = this._latencyUncertaintyMs = null;
+        this._latencyReason = '等待视频帧';
+        this._timeReason = '平台对时接口不可用';
+        this._timeSample = null;
+        this._timeSyncTimer = this._timeSyncRequestTimer = null;
+        this._timeSyncAbort = null;
         this.fps = 0;
         this.fpsCounter = 0;
         this.fpsLastCheck = 0;
@@ -236,6 +286,7 @@
 
         if (this.hasVideo) this._connectVideo();
         if (this.hasAudio) this._connectAudio();
+        this._startTimeSync();
     };
 
     /** Disconnect and clean up */
@@ -249,6 +300,90 @@
     /** Full cleanup (alias for backward compatibility) */
     CarrotPlayer.prototype.destroy = function () {
         this.disconnect();
+    };
+
+
+    // The browser uses a monotonic clock anchored to the server; its wall clock is irrelevant.
+    CarrotPlayer.prototype._startTimeSync = function () {
+        var self = this, generation = this._connectionGeneration;
+        if (!this.hasVideo || typeof fetch !== 'function') { this._timeReason = '平台对时接口不可用'; return; }
+        var run = function () {
+            if (self._stopped || self._connectionGeneration !== generation) return;
+            self._requestTimeSync(generation).finally(function () {
+                if (self._stopped || self._connectionGeneration !== generation) return;
+                self._timeSyncTimer = setTimeout(run, 60000);
+            });
+        };
+        run();
+    };
+
+    CarrotPlayer.prototype._requestTimeSync = async function (generation) {
+        var best = null, reason = '平台对时接口不可用';
+        var url = this.videoWsUrl.split('/ws?')[0].replace(/^ws/, 'http') + '/api/time';
+        for (var attempt = 0; attempt < 3; attempt++) {
+            if (this._stopped || this._connectionGeneration !== generation) return;
+            var controller = typeof AbortController === 'function' ? new AbortController() : null;
+            this._timeSyncAbort = controller;
+            var timer = setTimeout(function () { if (controller) controller.abort(); }, 4000);
+            this._timeSyncRequestTimer = timer;
+            try {
+                var start = performance.now();
+                var response = await fetch(url, { cache: 'no-store', credentials: 'omit', signal: controller ? controller.signal : undefined });
+                if (!response.ok) throw new Error('time endpoint unavailable');
+                var report = await response.json();
+                var finish = performance.now(), rtt = finish - start;
+                if (this._stopped || this._connectionGeneration !== generation) return;
+                if (report.synchronized !== true) {
+                    this._timeSample = null; this._timeReason = '平台时钟未同步'; return;
+                }
+                if (!Number.isSafeInteger(report.unix_ms) || report.unix_ms < 1577836800000 ||
+                    report.unix_ms > 4102444800000 || !Number.isFinite(report.max_error_ms) ||
+                    report.max_error_ms < 0 || report.max_error_ms > 1000 || rtt < 0 || rtt > 2000) {
+                    reason = '平台对时数据无效'; continue;
+                }
+                if (!best || rtt < best.rtt) best = {
+                    unixMs: report.unix_ms, monotonicMs: (start + finish) / 2,
+                    rtt: rtt, errorMs: report.max_error_ms
+                };
+            } catch (error) {
+                reason = '平台对时接口不可用';
+            } finally {
+                clearTimeout(timer);
+                if (this._timeSyncRequestTimer === timer) this._timeSyncRequestTimer = null;
+                if (this._timeSyncAbort === controller) this._timeSyncAbort = null;
+            }
+        }
+        if (this._stopped || this._connectionGeneration !== generation) return;
+        this._timeSample = best;
+        this._timeReason = best ? '' : reason;
+    };
+
+    CarrotPlayer.prototype._stopTimeSync = function () {
+        if (this._timeSyncTimer) clearTimeout(this._timeSyncTimer);
+        if (this._timeSyncRequestTimer) clearTimeout(this._timeSyncRequestTimer);
+        if (this._timeSyncAbort) this._timeSyncAbort.abort();
+        this._timeSyncTimer = this._timeSyncRequestTimer = null;
+        this._timeSyncAbort = null;
+        this._timeSample = null;
+        this._timeReason = '等待平台对时';
+    };
+
+    CarrotPlayer.prototype._measureVideoLatency = function (timing, drawnAt) {
+        this._receiveToRenderMs = timing && drawnAt !== null ? Math.max(0, drawnAt - timing.receivedAt) : null;
+        this._endToEndLatencyMs = this._latencyUncertaintyMs = null;
+        if (drawnAt === null) { this._latencyReason = '未提交Canvas绘制'; return; }
+        if (!timing || !timing.capture) { this._latencyReason = '车端无时间戳'; return; }
+        if (!timing.capture.synchronized) { this._latencyReason = '车端时钟未同步'; return; }
+        var sample = this._timeSample;
+        if (!sample) { this._latencyReason = this._timeReason; return; }
+        var age = drawnAt - sample.monotonicMs;
+        if (age < 0 || age > 90000) { this._latencyReason = '平台对时已过期'; return; }
+        var latency = sample.unixMs + age - timing.capture.unixMs;
+        if (latency < 0 || latency > 600000) { this._latencyReason = '时钟偏差或帧龄异常'; return; }
+        this._endToEndLatencyMs = latency;
+        // Clock error estimates, midpoint network uncertainty, and 500ppm age allowance.
+        this._latencyUncertaintyMs = sample.errorMs + timing.capture.errorMs + sample.rtt / 2 + age * 0.0005 + 2;
+        this._latencyReason = '';
     };
 
     // ---- Video WebSocket ----
@@ -280,8 +415,9 @@
 
         ws.onmessage = function (event) {
             if (self._stopped || self.videoWs !== ws) return;
+            var receivedAt = performance.now();
             var data = new Uint8Array(event.data);
-            self._handleVideoMessage(data);
+            self._handleVideoMessage(data, receivedAt);
         };
     };
 
@@ -326,6 +462,7 @@
     };
 
     CarrotPlayer.prototype._cleanup = function () {
+        this._stopTimeSync();
         this._cleanupVideo();
         this._cleanupAudio();
         this.connected = false;
@@ -355,6 +492,9 @@
         this.decodedCount = 0;
         this.droppedCount = 0;
         this.videoNeedsKeyframe = true;
+        this._frameTimings.clear();
+        this._receiveToRenderMs = this._endToEndLatencyMs = this._latencyUncertaintyMs = null;
+        this._latencyReason = '等待视频帧';
     };
 
     CarrotPlayer.prototype._cleanupAudio = function () {
@@ -498,7 +638,7 @@
 
     // ---- Video message handling ----
 
-    CarrotPlayer.prototype._handleVideoMessage = function (data) {
+    CarrotPlayer.prototype._handleVideoMessage = function (data, receivedAt) {
         if (data.length < 12) return;
 
         // Reset data timeout on any video data received
@@ -520,7 +660,7 @@
                 break;
             case 1: // MsgTypeVideoFrame
                 if (this.videoDecoder) {
-                    this._decodeVideoFrame(payload, timestamp);
+                    this._decodeVideoFrame(payload, timestamp, receivedAt === undefined ? performance.now() : receivedAt);
                 } else {
                     if (this.droppedCount < 10 || this.droppedCount % 50 === 0) {
                         console.warn('[CarrotSDK Player] Frame dropped: no decoder (dropped=' + this.droppedCount + ')');
@@ -586,14 +726,20 @@
             this.videoDecoder.close();
         }
 
-        this.videoDecoder = new VideoDecoder({
-            output: function (frame) { self._onVideoFrame(frame); },
+        this._frameTimings.clear();
+        var decoder = new VideoDecoder({
+            output: function (frame) {
+                if (self._stopped || self.videoDecoder !== decoder) { frame.close(); return; }
+                self._onVideoFrame(frame);
+            },
             error: function (e) {
+                if (self._stopped || self.videoDecoder !== decoder) return;
                 self.setStatus('\u89c6\u9891\u89e3\u7801\u9519\u8bef: ' + e.message, 'error');
                 console.error('[CarrotSDK] Video decoder error:', e);
             }
         });
 
+        this.videoDecoder = decoder;
         var spsLen = sps.length;
         var ppsLen = pps.length;
         var extradata = new Uint8Array(6 + 2 + spsLen + 1 + 2 + ppsLen);
@@ -625,7 +771,7 @@
         }
     };
 
-    CarrotPlayer.prototype._decodeVideoFrame = function (data, timestamp) {
+    CarrotPlayer.prototype._decodeVideoFrame = function (data, timestamp, receivedAt) {
         if (!this.videoDecoder || this.videoDecoder.state !== 'configured') {
             console.warn('[CarrotSDK Player] Skip decode: decoder=' + (!!this.videoDecoder) + ' state=' + (this.videoDecoder ? this.videoDecoder.state : 'N/A'));
             return;
@@ -652,18 +798,26 @@
         });
 
         try {
+            this._frameTimings.set(chunk.timestamp, {
+                receivedAt: receivedAt === undefined ? performance.now() : receivedAt,
+                capture: captureStamp(frameData)
+            });
+            while (this._frameTimings.size > 256) this._frameTimings.delete(this._frameTimings.keys().next().value);
             this.videoDecoder.decode(chunk);
             this.frameCount++;
             if (this.frameCount <= 3 || this.frameCount % 50 === 0) {
                 console.log('[CarrotSDK Player] Decode frame #' + this.frameCount + ' type=' + type + ' ts=' + timestamp + ' dataSize=' + frameData.length);
             }
         } catch (e) {
+            this._frameTimings.delete(chunk.timestamp);
             console.error('[CarrotSDK Player] Video decode error:', e, 'type=' + type + ' ts=' + timestamp + ' size=' + frameData.length + ' frameType=' + frameType);
             this.droppedCount++;
         }
     };
 
     CarrotPlayer.prototype._onVideoFrame = function (frame) {
+        var timing = this._frameTimings.get(frame.timestamp), drawnAt = null;
+        this._frameTimings.delete(frame.timestamp);
         this.decodedCount++;
 
         if (this.canvas &&
@@ -676,6 +830,7 @@
 
         if (this.ctx) {
             this.ctx.drawImage(frame, 0, 0);
+            drawnAt = performance.now();
             if (this.decodedCount <= 3 || this.decodedCount % 50 === 0) {
                 console.log('[CarrotSDK Player] Rendered frame #' + this.decodedCount + ' ' + frame.displayWidth + 'x' + frame.displayHeight);
             }
@@ -683,9 +838,9 @@
             console.warn('[CarrotSDK Player] No canvas context to render frame');
         }
 
-        if (this._onFrame) this._onFrame(frame);
-
-        frame.close();
+        this._measureVideoLatency(timing, drawnAt);
+        try { if (this._onFrame) this._onFrame(frame); }
+        finally { frame.close(); }
         this.lastFrameTime = performance.now();
         this._updateStats();
     };
@@ -888,9 +1043,10 @@
             this.fpsLastCheck = now;
         }
 
-        var latency = this.lastFrameTime > 0
-            ? ' ' + (now - this.lastFrameTime).toFixed(0) + 'ms'
-            : '';
+        var latency = ' | 取帧→绘制估算:' + (this._endToEndLatencyMs === null
+            ? '--（' + this._latencyReason + '）'
+            : this._endToEndLatencyMs.toFixed(0) + 'ms ±' + Math.ceil(this._latencyUncertaintyMs) + 'ms');
+        latency += ' | 网页处理:' + (this._receiveToRenderMs === null ? '--' : this._receiveToRenderMs.toFixed(1) + 'ms');
 
         var audioInfo = this.audioConfig
             ? ' | \u97f3\u9891:' + this.audioDecodedFrames + '\u5e27'
@@ -909,7 +1065,12 @@
                 frameCount: this.frameCount,
                 decodedCount: this.decodedCount,
                 droppedCount: this.droppedCount,
-                latency: this.lastFrameTime > 0 ? (now - this.lastFrameTime) : 0,
+                // latency is now nullable and has the same meaning as endToEndLatencyMs.
+                latency: this._endToEndLatencyMs,
+                endToEndLatencyMs: this._endToEndLatencyMs,
+                latencyUncertaintyMs: this._latencyUncertaintyMs,
+                receiveToRenderMs: this._receiveToRenderMs,
+                latencyUnavailableReason: this._latencyReason,
                 audioDecodedFrames: this.audioDecodedFrames
             });
         }
