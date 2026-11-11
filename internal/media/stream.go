@@ -2,6 +2,7 @@ package media
 
 import (
 	"encoding/binary"
+	"errors"
 	"sync"
 	"time"
 
@@ -42,6 +43,10 @@ type Subscriber struct {
 type Stream struct {
 	mu          sync.RWMutex
 	subscribers map[string]*Subscriber
+	done        chan struct{}
+	closed      bool
+	// published is guarded by StreamManager.mu, not Stream.mu.
+	published bool
 	// Video
 	sps, pps      []byte
 	width, height int
@@ -58,11 +63,50 @@ type Stream struct {
 func NewStream() *Stream {
 	return &Stream{
 		subscribers: make(map[string]*Subscriber),
+		done:        make(chan struct{}),
 	}
+}
+
+var ErrStreamClosed = errors.New("stream closed")
+
+// Done is closed when this publication ends or is replaced by a new generation.
+func (s *Stream) Done() <-chan struct{} { return s.done }
+
+// Close ends this generation. FrameChan stays open so a concurrent producer can
+// never panic on send; subscribers observe Done instead of draining stale frames.
+func (s *Stream) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	close(s.done)
+	for id, sub := range s.subscribers {
+		close(sub.Done)
+		delete(s.subscribers, id)
+	}
+	s.sps, s.pps = nil, nil
+	s.width, s.height = 0, 0
+	s.hasConfig = false
+	s.audioConfigData = nil
+	s.audioCodecType, s.sampleRate, s.channels = 0, 0, 0
+	s.hasAudioConfig = false
+}
+
+func (s *Stream) isClosed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.closed
 }
 
 // UpdateCodecConfig extracts H264 codec configuration from stream codecs
 func (s *Stream) UpdateCodecConfig(codecs []av.CodecData) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStreamClosed
+	}
 	for _, codec := range codecs {
 		if codec.Type().IsVideo() {
 			if vc, ok := codec.(av.VideoCodecData); ok {
@@ -84,6 +128,11 @@ func (s *Stream) UpdateCodecConfig(codecs []av.CodecData) error {
 
 // UpdateAudioCodecConfig extracts audio codec configuration from stream codecs
 func (s *Stream) UpdateAudioCodecConfig(codecs []av.CodecData) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStreamClosed
+	}
 	for _, codec := range codecs {
 		if codec.Type().IsAudio() {
 			if ac, ok := codec.(av.AudioCodecData); ok {
@@ -280,6 +329,9 @@ func (s *Stream) BroadcastAudioData(data []byte, timestampMs uint32) {
 func (s *Stream) SetAudioConfig(codecType byte, sampleRate int, channels int, configData []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
 
 	s.audioCodecType = codecType
 	s.sampleRate = sampleRate
@@ -293,6 +345,9 @@ func (s *Stream) SetAudioConfig(codecType byte, sampleRate int, channels int, co
 func (s *Stream) SetVideoConfig(sps, pps []byte, width, height int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
 
 	s.sps = make([]byte, len(sps))
 	copy(s.sps, sps)
@@ -333,14 +388,14 @@ func (s *Stream) BroadcastVideoData(data []byte, timestampMs uint32, isKeyFrame 
 
 // broadcastVideoToSubscribers sends a message only to subscribers that want video
 func (s *Stream) broadcastVideoToSubscribers(msg []byte) {
-	for id, sub := range s.subscribers {
+	for _, sub := range s.subscribers {
 		if !sub.WantsVideo {
 			continue
 		}
 		select {
 		case sub.FrameChan <- msg:
 		case <-sub.Done:
-			delete(s.subscribers, id)
+			// Removal is performed under the write lock by RemoveSubscriber/Close.
 		default:
 			// Channel full, skip this frame for slow subscriber
 		}
@@ -349,14 +404,14 @@ func (s *Stream) broadcastVideoToSubscribers(msg []byte) {
 
 // broadcastAudioToSubscribers sends a message only to subscribers that want audio
 func (s *Stream) broadcastAudioToSubscribers(msg []byte) {
-	for id, sub := range s.subscribers {
+	for _, sub := range s.subscribers {
 		if !sub.WantsAudio {
 			continue
 		}
 		select {
 		case sub.FrameChan <- msg:
 		case <-sub.Done:
-			delete(s.subscribers, id)
+			// Never mutate the subscriber map while the caller holds RLock.
 		default:
 			// Channel full, skip this frame for slow subscriber
 		}
@@ -373,6 +428,14 @@ func (s *Stream) AddSubscriber(id string, wantsVideo, wantsAudio bool) *Subscrib
 	}
 
 	s.mu.Lock()
+	if s.closed {
+		close(sub.Done)
+		s.mu.Unlock()
+		return sub
+	}
+	if previous, exists := s.subscribers[id]; exists {
+		close(previous.Done)
+	}
 	s.subscribers[id] = sub
 	s.mu.Unlock()
 
@@ -440,7 +503,7 @@ func (sm *StreamManager) GetOrCreateStream(path string) *Stream {
 	defer sm.mu.Unlock()
 
 	s, ok := sm.streams[path]
-	if !ok {
+	if !ok || s.isClosed() {
 		s = NewStream()
 		sm.streams[path] = s
 	}
@@ -454,11 +517,38 @@ func (sm *StreamManager) GetStream(path string) *Stream {
 	return sm.streams[path]
 }
 
-// RemoveStream removes a stream by path
-func (sm *StreamManager) RemoveStream(path string) {
+// BeginPublish claims an unconfigured playback placeholder on first publish.
+// Subsequent publishers get a new generation and disconnect old playback clients
+// so they can reconnect and receive the new codec configuration.
+func (sm *StreamManager) BeginPublish(path string) *Stream {
 	sm.mu.Lock()
-	delete(sm.streams, path)
+	previous := sm.streams[path]
+	if previous != nil && !previous.published && !previous.isClosed() {
+		previous.published = true
+		sm.mu.Unlock()
+		return previous
+	}
+	stream := NewStream()
+	stream.published = true
+	sm.streams[path] = stream
 	sm.mu.Unlock()
+	if previous != nil {
+		previous.Close()
+	}
+	return stream
+}
+
+// RemoveStream only removes the expected publisher's mapping. An old publisher
+// finishing after its replacement must not remove or close the replacement.
+func (sm *StreamManager) RemoveStream(path string, expected *Stream) {
+	sm.mu.Lock()
+	if sm.streams[path] == expected {
+		delete(sm.streams, path)
+	}
+	sm.mu.Unlock()
+	if expected != nil {
+		expected.Close()
+	}
 }
 
 // StreamCount returns the number of active streams

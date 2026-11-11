@@ -39,6 +39,14 @@
         return null;
     }
 
+    function audioReconnectDelay(value) {
+        if (typeof value !== 'number' || !Number.isFinite(value) ||
+            Math.floor(value) !== value || value < 100 || value > 30000) {
+            throw new RangeError('audioReconnectDelay must be an integer from 100 to 30000 ms');
+        }
+        return value;
+    }
+
     // ========================================================================
     //  CarrotSDK.Player
     //  Wraps WebCodecs-based H.264/AAC streaming player.
@@ -55,6 +63,7 @@
      * @param {string} [options.audioUrl]  - stream path for audio (e.g. 'audio/stream')
      * @param {string} [options.host]      - server host, defaults to current page host
      * @param {number} [options.port]      - server port, defaults to current page port
+     * @param {number} [options.audioReconnectDelay=500] - audio retry delay in ms (100..30000)
      * @param {function(string, string):void} [options.onStatus] - status callback(msg, type)
      * @param {function(Object):void} [options.onStats]           - stats callback
      * @param {function(VideoFrame):void} [options.onFrame]       - video frame callback
@@ -86,6 +95,10 @@
         this.videoReconnectTimer = null;
         this.audioReconnectTimer = null;
         this.connected = false;
+        this._stopped = true;
+        this._connectionGeneration = 0;
+        this._audioReconnectDelayMs = audioReconnectDelay(
+            options.audioReconnectDelay === undefined ? 500 : options.audioReconnectDelay);
 
         // Decoder state
         this.videoNeedsKeyframe = false;
@@ -128,6 +141,10 @@
         var videoUrlParam = params.get('videoUrl') || params.get('url');
         var audioUrlParam = params.get('audioUrl') || params.get('url');
         var dataTimeoutParam = params.get('dataTimeout');
+        var audioReconnectDelayParam = params.get('audioReconnectDelay');
+        if (audioReconnectDelayParam !== null) {
+            this._audioReconnectDelayMs = audioReconnectDelay(Number(audioReconnectDelayParam));
+        }
         if (dataTimeoutParam) {
             var parsed = parseInt(dataTimeoutParam, 10);
             if (!isNaN(parsed) && parsed > 0) {
@@ -186,6 +203,11 @@
      * Otherwise, pass them here.
      */
     CarrotPlayer.prototype.connect = function (videoUrl, audioUrl) {
+        // Invalidate queued callbacks/timers from previous explicit connections.
+        this._stopped = true;
+        this._connectionGeneration++;
+        this._cleanup();
+        this._stopped = false;
         if (videoUrl !== undefined) {
             this._videoUrl = videoUrl;
             this.hasVideo = !!videoUrl;
@@ -218,6 +240,8 @@
 
     /** Disconnect and clean up */
     CarrotPlayer.prototype.disconnect = function () {
+        this._stopped = true;
+        this._connectionGeneration++;
         this._cleanup();
         this.setStatus('\u5df2\u65ad\u5f00');
     };
@@ -230,26 +254,32 @@
     // ---- Video WebSocket ----
 
     CarrotPlayer.prototype._connectVideo = function () {
+        if (this._stopped || !this.hasVideo) return;
         var self = this;
-        this.videoWs = new WebSocket(this.videoWsUrl);
-        this.videoWs.binaryType = 'arraybuffer';
+        var ws = new WebSocket(this.videoWsUrl);
+        this.videoWs = ws;
+        ws.binaryType = 'arraybuffer';
 
-        this.videoWs.onopen = function () {
+        ws.onopen = function () {
+            if (self._stopped || self.videoWs !== ws) return;
             self.connected = true;
             self._updateConnectedStatus();
             self._resetVideoDataTimer();
         };
 
-        this.videoWs.onerror = function () {
+        ws.onerror = function () {
+            if (self._stopped || self.videoWs !== ws) return;
             self.setStatus('\u89c6\u9891\u8fde\u63a5\u5931\u8d25', 'error');
         };
 
-        this.videoWs.onclose = function () {
+        ws.onclose = function () {
+            if (self._stopped || self.videoWs !== ws) return;
             self._cleanupVideo();
             self._scheduleVideoReconnect();
         };
 
-        this.videoWs.onmessage = function (event) {
+        ws.onmessage = function (event) {
+            if (self._stopped || self.videoWs !== ws) return;
             var data = new Uint8Array(event.data);
             self._handleVideoMessage(data);
         };
@@ -258,26 +288,32 @@
     // ---- Audio WebSocket ----
 
     CarrotPlayer.prototype._connectAudio = function () {
+        if (this._stopped || !this.hasAudio) return;
         var self = this;
-        this.audioWs = new WebSocket(this.audioWsUrl);
-        this.audioWs.binaryType = 'arraybuffer';
+        var ws = new WebSocket(this.audioWsUrl);
+        this.audioWs = ws;
+        ws.binaryType = 'arraybuffer';
 
-        this.audioWs.onopen = function () {
+        ws.onopen = function () {
+            if (self._stopped || self.audioWs !== ws) return;
             self.connected = true;
             self._updateConnectedStatus();
             self._resetAudioDataTimer();
         };
 
-        this.audioWs.onerror = function () {
+        ws.onerror = function () {
+            if (self._stopped || self.audioWs !== ws) return;
             console.warn('[CarrotSDK] Audio connection failed (no audio stream?)');
         };
 
-        this.audioWs.onclose = function () {
+        ws.onclose = function () {
+            if (self._stopped || self.audioWs !== ws) return;
             self._cleanupAudio();
             self._scheduleAudioReconnect();
         };
 
-        this.audioWs.onmessage = function (event) {
+        ws.onmessage = function (event) {
+            if (self._stopped || self.audioWs !== ws) return;
             var data = new Uint8Array(event.data);
             self._handleAudioMessage(data);
         };
@@ -296,6 +332,13 @@
     };
 
     CarrotPlayer.prototype._cleanupVideo = function () {
+        // close() dispatches asynchronously; invalidate before stopping the socket.
+        var ws = this.videoWs;
+        this.videoWs = null;
+        if (ws) {
+            ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+            ws.close();
+        }
         if (this.videoReconnectTimer) {
             clearTimeout(this.videoReconnectTimer);
             this.videoReconnectTimer = null;
@@ -308,10 +351,6 @@
             this.videoDecoder.close();
             this.videoDecoder = null;
         }
-        if (this.videoWs) {
-            this.videoWs.close();
-            this.videoWs = null;
-        }
         this.frameCount = 0;
         this.decodedCount = 0;
         this.droppedCount = 0;
@@ -319,6 +358,12 @@
     };
 
     CarrotPlayer.prototype._cleanupAudio = function () {
+        var ws = this.audioWs;
+        this.audioWs = null;
+        if (ws) {
+            ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+            ws.close();
+        }
         if (this.audioReconnectTimer) {
             clearTimeout(this.audioReconnectTimer);
             this.audioReconnectTimer = null;
@@ -335,10 +380,6 @@
             this.audioCtx.close();
             this.audioCtx = null;
         }
-        if (this.audioWs) {
-            this.audioWs.close();
-            this.audioWs = null;
-        }
         this.nextAudioTime = 0;
         this.audioConfig = null;
         this.audioDecodedFrames = 0;
@@ -346,24 +387,32 @@
 
     CarrotPlayer.prototype._scheduleVideoReconnect = function () {
         var self = this;
-        if (this.videoReconnectTimer) return;
+        if (this._stopped || !this.hasVideo || this.videoReconnectTimer) return;
+        var generation = this._connectionGeneration;
         this.setStatus('\u89c6\u9891\u65ad\u5f00\uff0c5 \u79d2\u540e\u91cd\u8fde...', 'error');
-        this.videoReconnectTimer = setTimeout(function () {
+        var timer = setTimeout(function () {
+            if (self._stopped || self._connectionGeneration !== generation ||
+                self.videoReconnectTimer !== timer) return;
             self.videoReconnectTimer = null;
             self._cleanupVideo();
             if (self.hasVideo) self._connectVideo();
         }, 5000);
+        this.videoReconnectTimer = timer;
     };
 
     CarrotPlayer.prototype._scheduleAudioReconnect = function () {
         var self = this;
-        if (this.audioReconnectTimer) return;
-        this.setStatus('\u97f3\u9891\u65ad\u5f00\uff0c5 \u79d2\u540e\u91cd\u8fde...', 'error');
-        this.audioReconnectTimer = setTimeout(function () {
+        if (this._stopped || !this.hasAudio || this.audioReconnectTimer) return;
+        var generation = this._connectionGeneration;
+        this.setStatus('\u97f3\u9891\u65ad\u5f00\uff0c' + this._audioReconnectDelayMs + ' ms \u540e\u91cd\u8fde...', 'error');
+        var timer = setTimeout(function () {
+            if (self._stopped || self._connectionGeneration !== generation ||
+                self.audioReconnectTimer !== timer) return;
             self.audioReconnectTimer = null;
             self._cleanupAudio();
             if (self.hasAudio) self._connectAudio();
-        }, 5000);
+        }, this._audioReconnectDelayMs);
+        this.audioReconnectTimer = timer;
     };
 
     // ---- Data timeout detection ----
@@ -375,14 +424,15 @@
 
     CarrotPlayer.prototype._resetVideoDataTimer = function () {
         var self = this;
+        var ws = this.videoWs;
         this.videoDataTime = Date.now();
         if (this._videoDataTimer) {
             clearTimeout(this._videoDataTimer);
         }
-        if (!this._dataTimeoutMs || this._dataTimeoutMs <= 0) return;
-        this._videoDataTimer = setTimeout(function () {
+        if (this._stopped || !ws || !this._dataTimeoutMs || this._dataTimeoutMs <= 0) return;
+        var timer = setTimeout(function () {
+            if (self._stopped || self.videoWs !== ws || self._videoDataTimer !== timer) return;
             self._videoDataTimer = null;
-            if (!self.videoWs) return;
             // Check if we've received data within the timeout window
             var elapsed = Date.now() - self.videoDataTime;
             if (elapsed >= self._dataTimeoutMs) {
@@ -392,7 +442,9 @@
                 if (self.hasVideo) self._connectVideo();
             } else {
                 // Schedule next check at the remaining time
-                self._videoDataTimer = setTimeout(function () {
+                var remainingTimer = setTimeout(function () {
+                    if (self._stopped || self.videoWs !== ws ||
+                        self._videoDataTimer !== remainingTimer) return;
                     self._videoDataTimer = null;
                     var elapsed2 = Date.now() - self.videoDataTime;
                     if (elapsed2 >= self._dataTimeoutMs) {
@@ -402,20 +454,23 @@
                         if (self.hasVideo) self._connectVideo();
                     }
                 }, Math.max(100, self._dataTimeoutMs - elapsed));
+                self._videoDataTimer = remainingTimer;
             }
         }, this._dataTimeoutMs);
+        this._videoDataTimer = timer;
     };
 
     CarrotPlayer.prototype._resetAudioDataTimer = function () {
         var self = this;
+        var ws = this.audioWs;
         this.audioDataTime = Date.now();
         if (this._audioDataTimer) {
             clearTimeout(this._audioDataTimer);
         }
-        if (!this._dataTimeoutMs || this._dataTimeoutMs <= 0) return;
-        this._audioDataTimer = setTimeout(function () {
+        if (this._stopped || !ws || !this._dataTimeoutMs || this._dataTimeoutMs <= 0) return;
+        var timer = setTimeout(function () {
+            if (self._stopped || self.audioWs !== ws || self._audioDataTimer !== timer) return;
             self._audioDataTimer = null;
-            if (!self.audioWs) return;
             var elapsed = Date.now() - self.audioDataTime;
             if (elapsed >= self._dataTimeoutMs) {
                 self.setStatus('\u97f3\u9891\u6d41\u8d85\u65f6\uff0c\u91cd\u65b0\u8fde\u63a5...', 'error');
@@ -423,7 +478,9 @@
                 self._cleanupAudio();
                 if (self.hasAudio) self._connectAudio();
             } else {
-                self._audioDataTimer = setTimeout(function () {
+                var remainingTimer = setTimeout(function () {
+                    if (self._stopped || self.audioWs !== ws ||
+                        self._audioDataTimer !== remainingTimer) return;
                     self._audioDataTimer = null;
                     var elapsed2 = Date.now() - self.audioDataTime;
                     if (elapsed2 >= self._dataTimeoutMs) {
@@ -433,8 +490,10 @@
                         if (self.hasAudio) self._connectAudio();
                     }
                 }, Math.max(100, self._dataTimeoutMs - elapsed));
+                self._audioDataTimer = remainingTimer;
             }
         }, this._dataTimeoutMs);
+        this._audioDataTimer = timer;
     };
 
     // ---- Video message handling ----

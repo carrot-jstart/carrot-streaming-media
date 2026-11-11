@@ -53,8 +53,10 @@ func (s *Server) Start() error {
 		streamPath := extractStreamPath(conn.URL.String())
 		log.Printf("[RTMP] New publish stream: %s (path=%s)", conn.URL.String(), streamPath)
 
-		// Get or create the stream
-		stream := s.streamMgr.GetOrCreateStream(streamPath)
+		// Bind cleanup to this generation before reading codecs: Streams can fail,
+		// and an older publisher may finish after a replacement has started.
+		stream := s.streamMgr.BeginPublish(streamPath)
+		defer s.streamMgr.RemoveStream(streamPath, stream)
 
 		// Read codec info
 		codecs, err := conn.Streams()
@@ -110,7 +112,6 @@ func (s *Server) Start() error {
 		}
 
 		log.Printf("[RTMP] Publish stream closed: %s", streamPath)
-		s.streamMgr.RemoveStream(streamPath)
 	}
 
 	// Handle play events (optional, for fallback RTMP playback)

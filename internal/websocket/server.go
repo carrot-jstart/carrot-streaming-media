@@ -27,6 +27,7 @@ type Server struct {
 	streamMgr *media.StreamManager
 	port      string
 	connCount atomic.Int32
+	connSeq   atomic.Uint64
 	server    *http.Server
 	tlsConfig *tls.Config // nil = plain HTTP
 	webDir    string      // web static files directory
@@ -99,7 +100,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.connCount.Add(1)
-	connID := fmt.Sprintf("ws-%d", s.connCount.Load())
+	connID := fmt.Sprintf("ws-%d", s.connSeq.Add(1))
 
 	// Parse stream URL parameters — support three modes:
 	//   videoUrl=xxx  → video-only connection
@@ -154,19 +155,33 @@ func (s *Server) handleConnection(conn *gorilla.Conn, connID string, stream *med
 	}()
 
 	// Wait for relevant codec config(s) to be ready
-	waitStart := time.Now()
+	waitTimeout := time.NewTimer(30 * time.Second)
+	defer waitTimeout.Stop()
+	configTick := time.NewTicker(100 * time.Millisecond)
+	defer configTick.Stop()
 	for {
+		select {
+		case <-stream.Done():
+			return
+		default:
+		}
 		videoReady := !wantsVideo || stream.HasConfig()
 		audioReady := !wantsAudio || stream.HasAudioConfig()
 		if videoReady && audioReady {
 			break
 		}
-		if time.Since(waitStart) > 30*time.Second {
+		select {
+		case <-stream.Done():
+			return
+		case <-waitTimeout.C:
 			log.Printf("[WebSocket] Timeout waiting for stream config for %s", connID)
 			conn.WriteMessage(gorilla.CloseMessage, []byte("timeout waiting for stream"))
 			return
+		case <-configTick.C:
 		}
-		time.Sleep(100 * time.Millisecond)
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return
 	}
 
 	// Send video codec config if this connection wants video
@@ -206,6 +221,12 @@ func (s *Server) handleConnection(conn *gorilla.Conn, connID string, stream *med
 
 	var frameCount int
 	for {
+		// Prefer shutdown over any buffered frames from the ended publication.
+		select {
+		case <-sub.Done:
+			return
+		default:
+		}
 		select {
 		case <-sub.Done:
 			return
