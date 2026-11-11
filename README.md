@@ -1,5 +1,11 @@
 # Carrot Streaming Media
 
+SDK 1.1.0 已修正原先接近 0ms 的错误延迟显示。配合车端帧时间戳和服务端 `/api/time`，
+显示“取帧→Canvas 绘制”估算及误差，另列网页收帧后的处理耗时；缺少时间戳或未对时显示不可测。
+需要同时更新车端、Go 服务、SDK 和入口页面；仅替换网页不能得到车端到网页的估算。
+`onStats.latency` 现在可能为 null。部署和验证说明见[视频延迟对接](docs/video-latency.md)。
+当前为本地源码及开发验证，尚未部署现网。
+
 超低延迟流媒体服务器，支持 **RTMP 推流 + WebSocket 传输 + 浏览器 WebCodecs 硬件解码播放**。
 
 ---
