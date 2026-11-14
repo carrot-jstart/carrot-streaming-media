@@ -18,7 +18,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '1.1.0';
+    var VERSION = '1.1.1';
 
     // ========================================================================
     //  Utility helpers
@@ -124,6 +124,12 @@
         this.videoWs = null;
         this.audioWs = null;
         this.videoDecoder = null;
+        this._videoDecoderConfig = null;
+        this._maxVideoDecodeQueue = 6;
+        this.videoRecoveryCount = 0;
+        this._videoRecoveryLogAt = -Infinity;
+        this._videoRenderErrorAt = -Infinity;
+        this._statsDomAt = -Infinity;
         this.audioDecoder = null;
         this.audioCtx = null;
         this.nextAudioTime = 0;
@@ -238,13 +244,13 @@
         this.connect();
     };
 
-    CarrotPlayer.prototype.setStatus = function (msg, type) {
+    CarrotPlayer.prototype.setStatus = function (msg, type, quiet) {
         if (this.statusEl) {
-            this.statusEl.textContent = msg;
-            this.statusEl.className = type || '';
+            if (this.statusEl.textContent !== msg) this.statusEl.textContent = msg;
+            if (this.statusEl.className !== (type || '')) this.statusEl.className = type || '';
         }
         if (this._onStatus) this._onStatus(msg, type);
-        console.log('[CarrotSDK Player] ' + msg);
+        if (!quiet) console.log('[CarrotSDK Player] ' + msg);
     };
 
     /**
@@ -484,10 +490,10 @@
             clearTimeout(this._videoDataTimer);
             this._videoDataTimer = null;
         }
-        if (this.videoDecoder) {
-            this.videoDecoder.close();
-            this.videoDecoder = null;
-        }
+        this._closeVideoDecoder();
+        this._videoDecoderConfig = null;
+        this.videoRecoveryCount = 0;
+        this._statsDomAt = -Infinity;
         this.frameCount = 0;
         this.decodedCount = 0;
         this.droppedCount = 0;
@@ -649,24 +655,13 @@
         var payloadLen = readUint32(data, 8);
         var payload = data.slice(12, 12 + payloadLen);
 
-        if (this.frameCount === 0 && this.decodedCount === 0) {
-            console.log('[CarrotSDK Player] Video msg: type=' + msgType + ' ts=' + timestamp + ' payloadLen=' + payloadLen + ' dataLen=' + data.length);
-        }
-
         switch (msgType) {
             case 0: // MsgTypeCodecConfig
                 console.log('[CarrotSDK Player] Received codec config, payloadLen=' + payloadLen + ' decoder=' + (this.videoDecoder ? 'exists' : 'null'));
                 this._handleVideoCodecConfig(payload);
                 break;
             case 1: // MsgTypeVideoFrame
-                if (this.videoDecoder) {
-                    this._decodeVideoFrame(payload, timestamp, receivedAt === undefined ? performance.now() : receivedAt);
-                } else {
-                    if (this.droppedCount < 10 || this.droppedCount % 50 === 0) {
-                        console.warn('[CarrotSDK Player] Frame dropped: no decoder (dropped=' + this.droppedCount + ')');
-                    }
-                    this.droppedCount++;
-                }
+                this._decodeVideoFrame(payload, timestamp, receivedAt === undefined ? performance.now() : receivedAt);
                 break;
         }
     };
@@ -716,30 +711,63 @@
             (level.toString(16).padStart(2, '0'));
     };
 
+    CarrotPlayer.prototype._closeVideoDecoder = function () {
+        // Invalidate before close(): already queued output/error callbacks must
+        // never affect the replacement decoder, even within the same socket.
+        var decoder = this.videoDecoder;
+        this.videoDecoder = null;
+        if (decoder && decoder.state !== 'closed') {
+            try { decoder.close(); } catch (e) { /* Already closed by an error. */ }
+        }
+        this._frameTimings.clear();
+        this.videoNeedsKeyframe = true;
+    };
+
+    CarrotPlayer.prototype._recoverVideoDecoder = function (reason) {
+        this.droppedCount += this._frameTimings.size;
+        this._closeVideoDecoder();
+        this.videoRecoveryCount++;
+        // Rebuild only when the next keyframe arrives. An asynchronously failing
+        // configure must not create an unbounded error/recreate callback loop.
+        var now = performance.now();
+        if (now - this._videoRecoveryLogAt >= 1000) {
+            this._videoRecoveryLogAt = now;
+            this.setStatus('视频解码恢复，等待关键帧', 'connected', true);
+            console.warn('[CarrotSDK Player] Video decoder recovery: ' + reason);
+        }
+    };
+
+    CarrotPlayer.prototype._createVideoDecoder = function () {
+        if (this._stopped || !this._videoDecoderConfig) return false;
+        var self = this, decoder;
+        try {
+            decoder = new VideoDecoder({
+                output: function (frame) {
+                    if (self._stopped || self.videoDecoder !== decoder) { frame.close(); return; }
+                    self._onVideoFrame(frame);
+                },
+                error: function () {
+                    if (self._stopped || self.videoDecoder !== decoder) return;
+                    self._recoverVideoDecoder('decoder error');
+                }
+            });
+            this.videoDecoder = decoder;
+            decoder.configure(this._videoDecoderConfig);
+            this.videoNeedsKeyframe = true;
+            return true;
+        } catch (e) {
+            this._closeVideoDecoder();
+            this.setStatus('\u89c6\u9891\u89e3\u7801\u5668\u914d\u7f6e\u5931\u8d25: ' + e.message, 'error');
+            return false;
+        }
+    };
+
     CarrotPlayer.prototype._initVideoDecoder = function (codecStr, sps, pps) {
-        var self = this;
+        this._closeVideoDecoder();
         if (typeof VideoDecoder === 'undefined') {
             this.setStatus('\u6d4f\u89c8\u5668\u4e0d\u652f\u6301 WebCodecs VideoDecoder\uff0c\u8bf7\u4f7f\u7528 Chrome/Edge', 'error');
             return;
         }
-        if (this.videoDecoder) {
-            this.videoDecoder.close();
-        }
-
-        this._frameTimings.clear();
-        var decoder = new VideoDecoder({
-            output: function (frame) {
-                if (self._stopped || self.videoDecoder !== decoder) { frame.close(); return; }
-                self._onVideoFrame(frame);
-            },
-            error: function (e) {
-                if (self._stopped || self.videoDecoder !== decoder) return;
-                self.setStatus('\u89c6\u9891\u89e3\u7801\u9519\u8bef: ' + e.message, 'error');
-                console.error('[CarrotSDK] Video decoder error:', e);
-            }
-        });
-
-        this.videoDecoder = decoder;
         var spsLen = sps.length;
         var ppsLen = pps.length;
         var extradata = new Uint8Array(6 + 2 + spsLen + 1 + 2 + ppsLen);
@@ -759,59 +787,46 @@
         extradata[off++] = ppsLen & 0xFF;
         extradata.set(pps, off);
 
-        try {
-            this.videoDecoder.configure({
-                codec: codecStr,
-                description: extradata,
-                optimizeForLatency: true
-            });
-            this.videoNeedsKeyframe = true;
-        } catch (e) {
-            this.setStatus('\u89c6\u9891\u89e3\u7801\u5668\u914d\u7f6e\u5931\u8d25: ' + e.message, 'error');
-        }
+        this._videoDecoderConfig = { codec: codecStr, description: extradata, optimizeForLatency: true };
+        this._createVideoDecoder();
     };
 
     CarrotPlayer.prototype._decodeVideoFrame = function (data, timestamp, receivedAt) {
-        if (!this.videoDecoder || this.videoDecoder.state !== 'configured') {
-            console.warn('[CarrotSDK Player] Skip decode: decoder=' + (!!this.videoDecoder) + ' state=' + (this.videoDecoder ? this.videoDecoder.state : 'N/A'));
-            return;
-        }
-
+        if (this._stopped || !data.length) return;
         var frameType = data[0];
-        var frameData = data.slice(1);
         var type = frameType === 0 ? 'key' : 'delta';
-
+        if (this.videoDecoder && this.videoDecoder.state !== 'configured') {
+            this._recoverVideoDecoder('decoder is not configured');
+        }
+        if (this.videoDecoder && this.videoDecoder.decodeQueueSize >= this._maxVideoDecodeQueue) {
+            // Dropping arbitrary encoded P frames breaks the reference chain.
+            // Discard the old decoder's entire backlog and resume at a keyframe.
+            this._recoverVideoDecoder('decode queue limit');
+        }
         if (this.videoNeedsKeyframe) {
             if (type !== 'key') {
                 this.droppedCount++;
                 return;
             }
-            console.log('[CarrotSDK Player] Got first keyframe, starting decode');
-            this.videoNeedsKeyframe = false;
         }
-
-        var chunk = new EncodedVideoChunk({
-            type: type,
-            timestamp: timestamp * 1000,
-            duration: 33000,
-            data: frameData
-        });
-
+        if (!this.videoDecoder && type === 'key') this._createVideoDecoder();
+        if (!this.videoDecoder) { this.droppedCount++; return; }
+        var frameData = data.slice(1), chunk;
         try {
+            chunk = new EncodedVideoChunk({
+                type: type, timestamp: timestamp * 1000, duration: 33000, data: frameData
+            });
             this._frameTimings.set(chunk.timestamp, {
                 receivedAt: receivedAt === undefined ? performance.now() : receivedAt,
                 capture: captureStamp(frameData)
             });
             while (this._frameTimings.size > 256) this._frameTimings.delete(this._frameTimings.keys().next().value);
             this.videoDecoder.decode(chunk);
+            this.videoNeedsKeyframe = false;
             this.frameCount++;
-            if (this.frameCount <= 3 || this.frameCount % 50 === 0) {
-                console.log('[CarrotSDK Player] Decode frame #' + this.frameCount + ' type=' + type + ' ts=' + timestamp + ' dataSize=' + frameData.length);
-            }
         } catch (e) {
-            this._frameTimings.delete(chunk.timestamp);
-            console.error('[CarrotSDK Player] Video decode error:', e, 'type=' + type + ' ts=' + timestamp + ' size=' + frameData.length + ' frameType=' + frameType);
-            this.droppedCount++;
+            if (!chunk) this.droppedCount++;
+            this._recoverVideoDecoder('decode failed');
         }
     };
 
@@ -820,27 +835,31 @@
         this._frameTimings.delete(frame.timestamp);
         this.decodedCount++;
 
-        if (this.canvas &&
-            (this.canvas.width !== frame.displayWidth ||
-                this.canvas.height !== frame.displayHeight)) {
-            this.canvas.width = frame.displayWidth;
-            this.canvas.height = frame.displayHeight;
-            console.log('[CarrotSDK Player] Canvas resize: ' + frame.displayWidth + 'x' + frame.displayHeight);
-        }
-
-        if (this.ctx) {
-            this.ctx.drawImage(frame, 0, 0);
-            drawnAt = performance.now();
-            if (this.decodedCount <= 3 || this.decodedCount % 50 === 0) {
-                console.log('[CarrotSDK Player] Rendered frame #' + this.decodedCount + ' ' + frame.displayWidth + 'x' + frame.displayHeight);
+        try {
+            if (this.canvas &&
+                (this.canvas.width !== frame.displayWidth ||
+                    this.canvas.height !== frame.displayHeight)) {
+                this.canvas.width = frame.displayWidth;
+                this.canvas.height = frame.displayHeight;
             }
-        } else {
-            console.warn('[CarrotSDK Player] No canvas context to render frame');
-        }
 
-        this._measureVideoLatency(timing, drawnAt);
-        try { if (this._onFrame) this._onFrame(frame); }
-        finally { frame.close(); }
+            if (this.ctx) {
+                this.ctx.drawImage(frame, 0, 0);
+                drawnAt = performance.now();
+            }
+
+            this._measureVideoLatency(timing, drawnAt);
+            if (this._onFrame) this._onFrame(frame);
+        } catch (e) {
+            this.droppedCount++;
+            this._measureVideoLatency(timing, drawnAt);
+            var now = performance.now();
+            if (now - this._videoRenderErrorAt >= 1000) {
+                this._videoRenderErrorAt = now;
+                this.setStatus('视频绘制失败: ' + e.message, 'error', true);
+                console.warn('[CarrotSDK Player] Video output callback failed');
+            }
+        } finally { frame.close(); }
         this.lastFrameTime = performance.now();
         this._updateStats();
     };
@@ -1057,7 +1076,13 @@
             ' \u4e22\u5f03:' + this.droppedCount +
             latency + audioInfo;
 
-        this.setStatus(msg, this.connected ? 'connected' : '');
+        // Keep numeric stats/onStats per frame for API compatibility; DOM and
+        // onStatus updates are limited to 4 Hz and do not log each video frame.
+        if (now - this._statsDomAt >= 250) {
+            this._statsDomAt = now;
+            this.setStatus(msg, this.connected ? 'connected' : '', true);
+            if (this.fps > 0) document.title = this.fps + 'FPS - Carrot Streaming';
+        }
 
         if (this._onStats) {
             this._onStats({
@@ -1065,6 +1090,8 @@
                 frameCount: this.frameCount,
                 decodedCount: this.decodedCount,
                 droppedCount: this.droppedCount,
+                videoRecoveryCount: this.videoRecoveryCount,
+                videoDecodeQueueSize: this.videoDecoder ? this.videoDecoder.decodeQueueSize : 0,
                 // latency is now nullable and has the same meaning as endToEndLatencyMs.
                 latency: this._endToEndLatencyMs,
                 endToEndLatencyMs: this._endToEndLatencyMs,
@@ -1075,9 +1102,6 @@
             });
         }
 
-        if (this.fps > 0) {
-            document.title = this.fps + 'FPS - Carrot Streaming';
-        }
     };
 
 

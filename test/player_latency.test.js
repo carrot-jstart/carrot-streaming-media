@@ -78,7 +78,7 @@ function environment(options = {}) {
     }
     function feed(timestamp = 42, au = Buffer.from(fixture.auHex, 'hex')) {
         message(1, timestamp, Uint8Array.from([0, ...au]));
-        return player.videoDecoder.chunks.at(-1);
+        return player.videoDecoder && player.videoDecoder.chunks.at(-1);
     }
     function emit(chunk, delay = 12, decoder = player.videoDecoder) {
         clock.elapse(delay);
@@ -176,7 +176,9 @@ test('disconnect aborts a pending clock request and removes its timers', async (
 test('timing history is bounded and failed decodes do not leak timing records', async () => {
     const env = await ready(); env.player.videoDecoder.fail = true; env.feed();
     assert.equal(env.player._frameTimings.size, 0);
-    env.player.videoDecoder.fail = false;
+    // A failed decoder is discarded; the next keyframe rebuilds it from the
+    // cached codec configuration instead of reusing its broken reference chain.
+    assert.equal(env.player.videoDecoder, null);
     for (let i = 0; i < 300; i++) env.feed(i);
     assert.equal(env.player._frameTimings.size, 256);
     env.player.disconnect(); assert.equal(env.player._frameTimings.size, 0);
